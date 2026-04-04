@@ -37,7 +37,7 @@ CHUNK_SIZE       = 128 * 1024                                       # 128 KB str
 _pool = urllib3.PoolManager(
     num_pools=20,
     maxsize=10,
-    retries=False,
+    retries=urllib3.Retry(total=False, redirect=10),
 )
 
 # ---------------------------------------------------------------------------
