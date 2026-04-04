@@ -6,7 +6,7 @@ services:
     ports:
       - "7654:7654"
     environment:
-      - TZ=Europe/Lisbon
+      - TZ=<YOUR TIMEZONE>
       - M3U_URL=https://your-m3u-provider.example.com/playlist.m3u
       # - PROXY_PORT=7654
       # - DEFAULT_UA=Mozilla/5.0 (X11; Linux x86_64; rv:149.0) Gecko/20100101 Firefox/149.0

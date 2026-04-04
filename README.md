@@ -24,7 +24,7 @@ M3U playlists encode these via `#EXTVLCOPT` directives, which most media servers
 git clone https://github.com/anthonws/m3uproxy
 cd m3uproxy
 
-# Edit docker-compose.yml and set your M3U_URL
+# Edit docker-compose.yml, set your timezone and your M3U_URL
 docker compose up -d
 ```
 
