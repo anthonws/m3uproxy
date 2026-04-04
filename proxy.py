@@ -265,12 +265,18 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 self._error(404)
                 return
             hdrs = dict(ch["headers"])
-            print(f"[m3uproxy] → {ch['info'].split(',')[-1].strip()}", flush=True)
+            name = ch['info'].split(',')[-1].strip()
+            print(f"[m3uproxy] TUNE {name}", flush=True)
             try:
+                t0 = time.monotonic()
                 data = _fetch(ch["url"], hdrs, STREAM_TIMEOUT)
+                elapsed = time.monotonic() - t0
                 base = ch["url"].rsplit("/", 1)[0] + "/"
                 if b"#EXT" in data[:512]:
                     data = rewrite_m3u8(data, base, self.proxy_base(), hdrs)
+                    print(f"[m3uproxy] MASTER m3u8 {elapsed*1000:.0f}ms ({len(data)}B)", flush=True)
+                else:
+                    print(f"[m3uproxy] STREAM {elapsed*1000:.0f}ms ({len(data)}B)", flush=True)
                 self._send(200, "application/x-mpegurl", data)
             except Exception as e:
                 print(f"[m3uproxy] Stream {cid} error: {e}", flush=True)
@@ -286,7 +292,11 @@ class ProxyHandler(BaseHTTPRequestHandler):
             url  = urllib.parse.unquote(raw)
             hdrs = {k: query[k][0] for k in ("Referer", "User-Agent", "Origin") if k in query}
             try:
+                t0 = time.monotonic()
                 self._proxy_segment(url, hdrs)
+                elapsed = time.monotonic() - t0
+                label = "CHUNK" if url.endswith(".m3u8") or url.endswith(".m3u") else "SEG"
+                print(f"[m3uproxy] {label} {elapsed*1000:.0f}ms {url.split('/')[-1].split('?')[0]}", flush=True)
             except Exception as e:
                 print(f"[m3uproxy] Fetch error {url}: {e}", flush=True)
                 self._error(502)
