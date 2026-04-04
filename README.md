@@ -24,7 +24,10 @@ M3U playlists encode these via `#EXTVLCOPT` directives, which most media servers
 git clone https://github.com/anthonws/m3uproxy
 cd m3uproxy
 
-# Edit docker-compose.yml, set your timezone and your M3U_URL
+# Create your config from the sample
+cp .env.example .env
+# Edit .env and set M3U_URL and TZ
+
 docker compose up -d
 ```
 
@@ -41,7 +44,7 @@ http://<your-host>:7654/playlist.m3u
 | `PROXY_HOST`       | `0.0.0.0` | Bind address                                      |
 | `PROXY_PORT`       | `7654`  | Port to listen on                                   |
 | `DEFAULT_UA`       | Firefox Linux UA | Default User-Agent                         |
-| `PLAYLIST_TTL`     | `300`   | Seconds between background playlist refreshes       |
+| `PLAYLIST_TTL`     | `86400` | Seconds between background playlist refreshes       |
 | `CONNECT_TIMEOUT`  | `5`     | TCP connect timeout (seconds)                       |
 | `STREAM_TIMEOUT`   | `10`    | Per-segment read timeout (seconds)                  |
 | `PLAYLIST_TIMEOUT` | `20`    | Playlist fetch timeout (seconds)                    |

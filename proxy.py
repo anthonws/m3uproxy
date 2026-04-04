@@ -24,7 +24,7 @@ HOST             = os.environ.get("PROXY_HOST", "0.0.0.0")
 PORT             = int(os.environ.get("PROXY_PORT", "7654"))
 UA               = os.environ.get("DEFAULT_UA",
                        "Mozilla/5.0 (X11; Linux x86_64; rv:149.0) Gecko/20100101 Firefox/149.0")
-PLAYLIST_TTL     = int(os.environ.get("PLAYLIST_TTL",     "300"))  # seconds between background refreshes
+PLAYLIST_TTL     = int(os.environ.get("PLAYLIST_TTL",     "86400"))  # seconds between background refreshes
 CONNECT_TIMEOUT  = int(os.environ.get("CONNECT_TIMEOUT",  "5"))    # TCP connect timeout
 STREAM_TIMEOUT   = int(os.environ.get("STREAM_TIMEOUT",   "10"))   # per-segment read timeout
 PLAYLIST_TIMEOUT = int(os.environ.get("PLAYLIST_TIMEOUT", "20"))   # playlist fetch timeout
