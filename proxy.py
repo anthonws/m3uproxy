@@ -44,6 +44,7 @@ _pool = urllib3.PoolManager(
 # Playlist cache
 # ---------------------------------------------------------------------------
 _channels: dict = {}
+_header: str = "#EXTM3U"
 _cache_ts: float = 0.0
 _cache_lock = threading.Lock()
 
@@ -97,14 +98,18 @@ def _fetch(url: str, extra_headers: dict, timeout: int) -> bytes:
 # Playlist parsing and building
 # ---------------------------------------------------------------------------
 
-def parse_playlist(content: bytes) -> dict:
+def parse_playlist(content: bytes) -> tuple[dict, str]:
+    """Returns (channels, extm3u_header) preserving the original #EXTM3U line."""
     channels: dict = {}
+    header = "#EXTM3U"
     lines = content.decode("utf-8", errors="replace").splitlines()
     cid = 1
     i = 0
     while i < len(lines):
         line = lines[i].strip()
-        if line.startswith("#EXTINF"):
+        if line.startswith("#EXTM3U"):
+            header = line
+        elif line.startswith("#EXTINF"):
             info = line
             hdrs: dict = {}
             i += 1
@@ -125,11 +130,11 @@ def parse_playlist(content: bytes) -> dict:
                     channels[str(cid)] = {"info": info, "url": url, "headers": hdrs}
                     cid += 1
         i += 1
-    return channels
+    return channels, header
 
 
-def build_playlist(proxy_base: str, channels: dict) -> str:
-    lines = ["#EXTM3U"]
+def build_playlist(proxy_base: str, channels: dict, header: str) -> str:
+    lines = [header]
     for cid, ch in channels.items():
         lines.append(ch["info"])
         lines.append(f"{proxy_base}/stream/{cid}")
@@ -163,9 +168,10 @@ def refresh_playlist() -> bool:
     try:
         data = _fetch(M3U_URL, {}, PLAYLIST_TIMEOUT)
         print(f"[m3uproxy] Fetched {len(data):,} bytes", flush=True)
-        channels = parse_playlist(data)
+        channels, header = parse_playlist(data)
         with _cache_lock:
             _channels = channels
+            _header = header
             _cache_ts = time.monotonic()
         if channels:
             print(f"[m3uproxy] Loaded {len(channels)} channels", flush=True)
@@ -184,24 +190,26 @@ def _background_refresher() -> None:
         refresh_playlist()
 
 
-def _ensure_channels() -> dict:
+def _ensure_channels() -> tuple[dict, str]:
     """
-    Return the current channel cache.
+    Return (channels, header) from cache.
     - Blocks synchronously only on first load (empty cache).
     - Triggers a background refresh when the TTL has expired; serves stale data immediately.
     """
     with _cache_lock:
         channels = _channels
+        header = _header
         age = time.monotonic() - _cache_ts
 
     if not channels:
         refresh_playlist()
         with _cache_lock:
             channels = _channels
+            header = _header
     elif age > PLAYLIST_TTL:
         threading.Thread(target=refresh_playlist, daemon=True).start()
 
-    return channels
+    return channels, header
 
 
 # ---------------------------------------------------------------------------
@@ -239,11 +247,11 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
         # ── /playlist.m3u ────────────────────────────────────────────────────
         if path in ("/playlist.m3u", "/"):
-            channels = _ensure_channels()
+            channels, header = _ensure_channels()
             if not channels:
                 self._error(503)
                 return
-            m3u = build_playlist(self.proxy_base(), channels)
+            m3u = build_playlist(self.proxy_base(), channels, header)
             self._send(200, "application/x-mpegurl", m3u.encode())
             return
 
