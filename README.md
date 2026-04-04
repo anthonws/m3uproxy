@@ -35,12 +35,17 @@ http://<your-host>:7654/playlist.m3u
 
 ## Environment Variables
 
-| Variable     | Default                                      | Description              |
-|-------------|----------------------------------------------|--------------------------|
-| `M3U_URL`   | *(required)*                                 | URL of your M3U playlist |
-| `PROXY_HOST`| `0.0.0.0`                                    | Bind address             |
-| `PROXY_PORT`| `7654`                                       | Port to listen on        |
-| `DEFAULT_UA`| Firefox Linux UA                             | Default User-Agent       |
+| Variable           | Default | Description                                         |
+|--------------------|---------|-----------------------------------------------------|
+| `M3U_URL`          | *(required)* | URL of your M3U playlist                       |
+| `PROXY_HOST`       | `0.0.0.0` | Bind address                                      |
+| `PROXY_PORT`       | `7654`  | Port to listen on                                   |
+| `DEFAULT_UA`       | Firefox Linux UA | Default User-Agent                         |
+| `PLAYLIST_TTL`     | `300`   | Seconds between background playlist refreshes       |
+| `CONNECT_TIMEOUT`  | `5`     | TCP connect timeout (seconds)                       |
+| `STREAM_TIMEOUT`   | `10`    | Per-segment read timeout (seconds)                  |
+| `PLAYLIST_TIMEOUT` | `20`    | Playlist fetch timeout (seconds)                    |
+| `FETCH_RETRIES`    | `2`     | Retries on transient upstream errors                |
 
 ## Supported Headers
 
