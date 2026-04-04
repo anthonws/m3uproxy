@@ -76,6 +76,20 @@ Reads the following `#EXTVLCOPT` directives from the M3U:
 
 - Emby Media Server
 
+## Security
+
+**Do not expose m3uproxy directly to the internet.** The proxy has no authentication and will relay requests to your upstream M3U source on behalf of anyone who can reach it. It is intended to run on a private network, accessible only to your local media server.
+
+If you need remote access, place it behind a reverse proxy (e.g. Nginx, Caddy, Traefik) with authentication enabled.
+
+Binding to `PROXY_HOST=127.0.0.1` restricts the proxy to localhost only, which is the safest option if your media server runs on the same host.
+
+## Disclaimer
+
+This project is provided as-is, without warranty of any kind. The author takes no responsibility for any damages, data loss, legal issues, or any other consequences arising from the use of this software.
+
+**This tool is intended for use with legal, licensed IPTV services and publicly available streams only. The author does not endorse or support piracy or the use of unauthorised IPTV services.** It is your responsibility to ensure that the content you access complies with the laws and regulations of your country and the terms of service of your provider.
+
 ## License
 
 MIT
