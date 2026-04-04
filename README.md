@@ -37,7 +37,7 @@ http://<your-host>:7654/playlist.m3u
 
 | Variable     | Default                                      | Description              |
 |-------------|----------------------------------------------|--------------------------|
-| `M3U_URL`   | M3UPT playlist                               | URL of your M3U playlist |
+| `M3U_URL`   | *(required)*                                 | URL of your M3U playlist |
 | `PROXY_HOST`| `0.0.0.0`                                    | Bind address             |
 | `PROXY_PORT`| `7654`                                       | Port to listen on        |
 | `DEFAULT_UA`| Firefox Linux UA                             | Default User-Agent       |
@@ -52,7 +52,6 @@ Reads the following `#EXTVLCOPT` directives from the M3U:
 
 ## Tested With
 
-- [M3UPT](https://github.com/LITUATUI/M3UPT) — Portuguese free IPTV playlist
 - Emby Media Server
 
 ## License
