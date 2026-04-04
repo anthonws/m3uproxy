@@ -57,14 +57,26 @@ def _headers(extra: dict) -> dict:
 
 
 def _fetch(url: str, extra_headers: dict, timeout: int) -> bytes:
-    """Fetch a URL fully into memory with retries. urllib3 handles decompression."""
+    """Fetch a URL fully into memory with retries and manual redirect following."""
     h = _headers(extra_headers)
     t = urllib3.Timeout(connect=CONNECT_TIMEOUT, read=timeout)
     last_exc: Exception | None = None
 
     for attempt in range(FETCH_RETRIES + 1):
         try:
-            r = _pool.request("GET", url, headers=h, timeout=t, preload_content=True)
+            current_url = url
+            for _ in range(10):  # follow up to 10 redirects manually
+                r = _pool.request("GET", current_url, headers=h, timeout=t,
+                                  preload_content=True, redirect=False)
+                print(f"[m3uproxy] HTTP {r.status} {current_url}", flush=True)
+                if r.status in (301, 302, 303, 307, 308):
+                    location = r.headers.get("Location", "")
+                    if not location:
+                        raise OSError("Redirect with no Location header")
+                    current_url = urllib.parse.urljoin(current_url, location)
+                    continue
+                break
+
             if r.status >= 500 and attempt < FETCH_RETRIES:
                 time.sleep(0.5 * (attempt + 1))
                 continue
