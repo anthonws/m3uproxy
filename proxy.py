@@ -68,7 +68,7 @@ def _fetch(url: str, extra_headers: dict, timeout: int) -> bytes:
             for _ in range(10):  # follow up to 10 redirects manually
                 r = _pool.request("GET", current_url, headers=h, timeout=t,
                                   preload_content=True, redirect=False)
-                print(f"[m3uproxy] HTTP {r.status} {current_url}", flush=True)
+
                 if r.status in (301, 302, 303, 307, 308):
                     location = r.headers.get("Location", "")
                     if not location:
@@ -162,9 +162,7 @@ def refresh_playlist() -> bool:
     print(f"[m3uproxy] Fetching playlist: {M3U_URL}", flush=True)
     try:
         data = _fetch(M3U_URL, {}, PLAYLIST_TIMEOUT)
-        print(f"[m3uproxy] Fetched {len(data)} bytes", flush=True)
-        preview = data[:200].decode("utf-8", errors="replace").strip()
-        print(f"[m3uproxy] Content preview: {preview!r}", flush=True)
+        print(f"[m3uproxy] Fetched {len(data):,} bytes", flush=True)
         channels = parse_playlist(data)
         with _cache_lock:
             _channels = channels
