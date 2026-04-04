@@ -145,18 +145,25 @@ def rewrite_m3u8(content: bytes, base_url: str, proxy_base: str, headers: dict) 
 def refresh_playlist() -> bool:
     global _channels, _cache_ts
     if not M3U_URL:
-        print("[m3uproxy] M3U_URL is not set", flush=True)
+        print("[m3uproxy] ERROR: M3U_URL is not set", flush=True)
         return False
+    print(f"[m3uproxy] Fetching playlist: {M3U_URL}", flush=True)
     try:
         data = _fetch(M3U_URL, {}, PLAYLIST_TIMEOUT)
+        print(f"[m3uproxy] Fetched {len(data)} bytes", flush=True)
+        preview = data[:200].decode("utf-8", errors="replace").strip()
+        print(f"[m3uproxy] Content preview: {preview!r}", flush=True)
         channels = parse_playlist(data)
         with _cache_lock:
             _channels = channels
             _cache_ts = time.monotonic()
-        print(f"[m3uproxy] Loaded {len(channels)} channels", flush=True)
+        if channels:
+            print(f"[m3uproxy] Loaded {len(channels)} channels", flush=True)
+        else:
+            print("[m3uproxy] WARNING: 0 channels parsed — playlist may be empty or in an unexpected format", flush=True)
         return True
     except Exception as e:
-        print(f"[m3uproxy] Playlist refresh failed: {e}", flush=True)
+        print(f"[m3uproxy] Playlist refresh failed: {type(e).__name__}: {e}", flush=True)
         return False
 
 
