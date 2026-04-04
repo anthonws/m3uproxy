@@ -24,9 +24,8 @@ M3U playlists encode these via `#EXTVLCOPT` directives, which most media servers
 git clone https://github.com/anthonws/m3uproxy
 cd m3uproxy
 
-# Create your config from the sample
+# Create your config from the sample and fill in M3U_URL and TZ
 cp .env.example .env
-# Edit .env and set M3U_URL and TZ
 
 docker compose up -d
 ```
@@ -35,6 +34,21 @@ Then point your media server tuner to:
 ```
 http://<your-host>:7654/playlist.m3u
 ```
+
+### Running without Docker
+
+```bash
+pip install -r requirements.txt
+# Set variables in your environment or export them manually
+export M3U_URL="https://your-m3u-provider.example.com/playlist.m3u"
+python proxy.py
+```
+
+## Configuration
+
+Copy `.env.example` to `.env` and edit it. Quote `M3U_URL` and `DEFAULT_UA`
+with double quotes — Docker Compose's `.env` parser treats `#` as a comment
+delimiter, which can silently truncate unquoted values.
 
 ## Environment Variables
 
