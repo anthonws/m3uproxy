@@ -69,6 +69,8 @@ delimiter, which can silently truncate unquoted values.
 | `MAX_CONCURRENT`   | `0`     | Cap on in-flight requests; `0` = unlimited          |
 | `CLIENT_TIMEOUT`   | `30`    | Seconds an idle keep-alive client connection is held |
 | `LOG_LEVEL`        | `INFO`  | Log verbosity (`DEBUG`/`INFO`/`WARNING`/`ERROR`)    |
+| `LOGS_ENDPOINT`    | `0`     | Set `1` to expose recent logs at `GET /logs`        |
+| `LOG_RING_MAX`     | `300`   | Recent log lines kept in memory for `/logs`         |
 
 ### Tuning for larger deployments
 
@@ -108,6 +110,26 @@ It returns `200` when channels are loaded and `503` when the cache is empty (e.g
 first playlist fetch failed), so it doubles as a container healthcheck. It is exempt from
 `MAX_CONCURRENT` so monitoring stays truthful under load. Logs are structured (timestamp,
 level, message) on stdout; raise detail with `LOG_LEVEL=DEBUG`.
+
+The container ships a Docker `HEALTHCHECK` that probes `/health`, so `docker ps` and the
+Synology Container Manager show health status.
+
+### Reading logs
+
+Logs go to stdout — read them with `docker logs m3uproxy --tail 100 -f`, or in Synology
+Container Manager under the container's **Log** tab.
+
+For convenience you can also expose the most recent log lines over HTTP by setting
+`LOGS_ENDPOINT=1`:
+
+```
+GET /logs            # last LOG_RING_MAX lines (plain text)
+GET /logs?tail=50    # last 50 lines
+```
+
+Query strings are stripped from logged request lines, so the per-channel `Referer`/
+`Origin`/`User-Agent` values are not recorded. **`/logs` is still unauthenticated like the
+rest of the proxy — keep it LAN-only.** It is disabled by default (`404`).
 
 ## Supported Headers
 

@@ -304,6 +304,48 @@ class KeepAliveFramingTest(unittest.TestCase):
         finally:
             proxy._channels = saved
 
+    def test_logs_endpoint_404_when_disabled(self):
+        self.assertFalse(proxy.LOGS_ENDPOINT)  # opt-in, off by default
+        c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        c.request("GET", "/logs")
+        r = c.getresponse()
+        r.read()
+        self.assertEqual(r.status, 404)
+        c.close()
+
+    def test_logs_endpoint_returns_text_when_enabled(self):
+        orig = proxy.LOGS_ENDPOINT
+        proxy.LOGS_ENDPOINT = True
+        try:
+            c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+            c.request("GET", "/playlist.m3u")          # generate a log line
+            c.getresponse().read()
+            c.request("GET", "/logs")
+            r = c.getresponse()
+            body = r.read().decode()
+            self.assertEqual(r.status, 200)
+            self.assertTrue(r.getheader("Content-Type").startswith("text/plain"))
+            self.assertIn("playlist.m3u", body)
+            c.close()
+        finally:
+            proxy.LOGS_ENDPOINT = orig
+
+    def test_logs_scrub_query_strings(self):
+        orig = proxy.LOGS_ENDPOINT
+        proxy.LOGS_ENDPOINT = True
+        try:
+            c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+            c.request("GET", "/playlist.m3u?token=SECRET123")  # query carries a "token"
+            c.getresponse().read()
+            c.request("GET", "/logs")
+            r = c.getresponse()
+            body = r.read().decode()
+            c.close()
+            self.assertNotIn("SECRET123", body)  # query stripped from the access log
+            self.assertIn("?…", body)        # replaced with "?…"
+        finally:
+            proxy.LOGS_ENDPOINT = orig
+
     def test_started_flag_resets_between_keepalive_requests(self):
         # A success then a failing request on the SAME connection: the failure must
         # still send its 502. Regression guard for the per-instance _started flag
