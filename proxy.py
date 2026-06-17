@@ -6,8 +6,11 @@ Reads #EXTVLCOPT directives from M3U playlists and injects the correct
 Referer, User-Agent and Origin headers when proxying HLS streams.
 """
 
+import json
+import logging
 import os
 import re
+import sys
 import threading
 import time
 import urllib.parse
@@ -15,28 +18,45 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import urllib3
 
-__version__ = "1.4"
+__version__ = "1.5"
+
+log = logging.getLogger("m3uproxy")
+
+
+def _envint(name: str, default: int) -> int:
+    """Read an integer env var, exiting with a clear message on a bad value."""
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        # logging isn't configured yet at config-parse time; print the fatal directly.
+        print(f"[m3uproxy] FATAL: {name} must be an integer, got {raw!r}", flush=True)
+        sys.exit(1)
+
 
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 M3U_URL          = os.environ.get("M3U_URL", "")
 HOST             = os.environ.get("PROXY_HOST", "0.0.0.0")
-PORT             = int(os.environ.get("PROXY_PORT", "7654"))
+PORT             = _envint("PROXY_PORT", 7654)
 UA               = os.environ.get("DEFAULT_UA",
                        "Mozilla/5.0 (X11; Linux x86_64; rv:149.0) Gecko/20100101 Firefox/149.0")
-PLAYLIST_TTL     = int(os.environ.get("PLAYLIST_TTL",     "86400"))  # seconds between background refreshes
-CONNECT_TIMEOUT  = int(os.environ.get("CONNECT_TIMEOUT",  "5"))    # TCP connect timeout
-STREAM_TIMEOUT   = int(os.environ.get("STREAM_TIMEOUT",   "10"))   # per-segment read timeout
-PLAYLIST_TIMEOUT = int(os.environ.get("PLAYLIST_TIMEOUT", "20"))   # playlist fetch timeout
-FETCH_RETRIES    = int(os.environ.get("FETCH_RETRIES",    "2"))    # retries on transient errors
-CHUNKLIST_TTL    = int(os.environ.get("CHUNKLIST_TTL",    "2"))    # seconds to cache a chunklist (0 disables)
-CHUNK_SIZE       = 128 * 1024                                       # 128 KB streaming chunks
-SEG_CACHE_MAX    = 500                                              # max cached chunklists (memory bound)
-POOL_NUM_POOLS   = int(os.environ.get("POOL_NUM_POOLS",   "20"))   # distinct upstream hosts pooled
-POOL_MAXSIZE     = int(os.environ.get("POOL_MAXSIZE",     "32"))   # keep-alive conns kept per upstream host
-MAX_CONCURRENT   = int(os.environ.get("MAX_CONCURRENT",   "0"))    # in-flight request cap (0 = unlimited)
-CLIENT_TIMEOUT   = int(os.environ.get("CLIENT_TIMEOUT",   "30"))   # idle keep-alive socket timeout (seconds)
+PLAYLIST_TTL     = _envint("PLAYLIST_TTL",     86400)  # seconds between background refreshes
+CONNECT_TIMEOUT  = _envint("CONNECT_TIMEOUT",  5)      # TCP connect timeout
+STREAM_TIMEOUT   = _envint("STREAM_TIMEOUT",   10)     # per-segment read timeout
+PLAYLIST_TIMEOUT = _envint("PLAYLIST_TIMEOUT", 20)     # playlist fetch timeout
+FETCH_RETRIES    = _envint("FETCH_RETRIES",    2)      # retries on transient errors
+CHUNKLIST_TTL    = _envint("CHUNKLIST_TTL",    2)      # seconds to cache a chunklist (0 disables)
+CHUNK_SIZE       = 128 * 1024                          # 128 KB streaming chunks
+SEG_CACHE_MAX    = 500                                 # max cached chunklists (memory bound)
+POOL_NUM_POOLS   = _envint("POOL_NUM_POOLS",   20)     # distinct upstream hosts pooled
+POOL_MAXSIZE     = _envint("POOL_MAXSIZE",     32)     # keep-alive conns kept per upstream host
+MAX_CONCURRENT   = _envint("MAX_CONCURRENT",   0)      # in-flight request cap (0 = unlimited)
+CLIENT_TIMEOUT   = _envint("CLIENT_TIMEOUT",   30)     # idle keep-alive socket timeout (seconds)
+LOG_LEVEL        = os.environ.get("LOG_LEVEL", "INFO")
 
 # ---------------------------------------------------------------------------
 # Connection pool  (shared across all threads)
@@ -62,6 +82,19 @@ _cache_ts: float = 0.0
 _cache_lock = threading.Lock()
 
 # ---------------------------------------------------------------------------
+# Observability state
+# ---------------------------------------------------------------------------
+_last_refresh_ok_ts: float = 0.0
+_last_refresh_err: str | None = None
+_stats = {"stream_ok": 0, "stream_err": 0, "fetch_ok": 0, "fetch_err": 0}
+_stats_lock = threading.Lock()
+
+
+def _bump(key: str) -> None:
+    with _stats_lock:
+        _stats[key] += 1
+
+# ---------------------------------------------------------------------------
 # Chunklist micro-cache
 #
 # Live HLS chunklists are re-requested every few seconds by every viewer. Caching
@@ -80,6 +113,14 @@ _seg_cache_lock = threading.Lock()
 
 def _headers(extra: dict) -> dict:
     return {"User-Agent": UA, **extra}
+
+
+def _safe_host(url: str) -> str:
+    """Host[:port] of a URL for logging — never the path/query (which may hold tokens)."""
+    try:
+        return urllib.parse.urlsplit(url).netloc or url
+    except ValueError:
+        return "<invalid-url>"
 
 
 def _chunklist_cache_get(url: str, now: float) -> tuple[bytes, str] | None:
@@ -243,26 +284,30 @@ def rewrite_m3u8(content: bytes, base_url: str, proxy_base: str, headers: dict) 
 # ---------------------------------------------------------------------------
 
 def refresh_playlist() -> bool:
-    global _channels, _header, _cache_ts
+    global _channels, _header, _cache_ts, _last_refresh_ok_ts, _last_refresh_err
     if not M3U_URL:
-        print("[m3uproxy] ERROR: M3U_URL is not set", flush=True)
+        log.error("M3U_URL is not set")
+        _last_refresh_err = "M3U_URL is not set"
         return False
-    print(f"[m3uproxy] Fetching playlist: {M3U_URL}", flush=True)
+    log.info("Fetching playlist: %s", _safe_host(M3U_URL))
     try:
         data, _ = _fetch(M3U_URL, {}, PLAYLIST_TIMEOUT)
-        print(f"[m3uproxy] Fetched {len(data):,} bytes", flush=True)
+        log.info("Fetched %s bytes", f"{len(data):,}")
         channels, header = parse_playlist(data)
         with _cache_lock:
             _channels = channels
             _header = header
             _cache_ts = time.monotonic()
         if channels:
-            print(f"[m3uproxy] Loaded {len(channels)} channels", flush=True)
+            log.info("Loaded %d channels", len(channels))
         else:
-            print("[m3uproxy] WARNING: 0 channels parsed — playlist may be empty or in an unexpected format", flush=True)
+            log.warning("0 channels parsed — playlist may be empty or in an unexpected format")
+        _last_refresh_ok_ts = time.monotonic()
+        _last_refresh_err = None
         return True
     except Exception as e:
-        print(f"[m3uproxy] Playlist refresh failed: {type(e).__name__}: {e}", flush=True)
+        log.error("Playlist refresh failed: %s: %s", type(e).__name__, e)
+        _last_refresh_err = f"{type(e).__name__}: {e}"
         return False
 
 
@@ -313,7 +358,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
     _started = False
 
     def log_message(self, fmt, *args):
-        print(f"[m3uproxy] {self.address_string()} – {fmt % args}", flush=True)
+        log.info("%s – %s", self.address_string(), fmt % args)
 
     def proxy_base(self) -> str:
         host = self.headers.get("Host", f"127.0.0.1:{PORT}")
@@ -348,7 +393,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
         # Optional cap on concurrently-PROCESSING requests. Past the cap, shed load: fail
         # fast (non-blocking, so no thread parks waiting) and close the connection so the
         # client doesn't immediately retry on the same socket. Off unless MAX_CONCURRENT set.
-        if _sem is None:
+        # /health bypasses the cap so monitoring stays truthful even under load.
+        if _sem is None or urllib.parse.urlparse(self.path).path == "/health":
             self._handle()
             return
         if not _sem.acquire(blocking=False):
@@ -366,6 +412,26 @@ class ProxyHandler(BaseHTTPRequestHandler):
         parsed = urllib.parse.urlparse(self.path)
         path   = parsed.path
         query  = urllib.parse.parse_qs(parsed.query)
+
+        # ── /health ──────────────────────────────────────────────────────────
+        if path == "/health":
+            now = time.monotonic()
+            with _cache_lock:
+                n = len(_channels)
+                cache_age = round(now - _cache_ts, 1) if _cache_ts else None
+            with _stats_lock:
+                stats = dict(_stats)
+            body = {
+                "ok": bool(n),
+                "version": __version__,
+                "channels": n,
+                "cache_age_s": cache_age,
+                "last_refresh_ok_age_s": round(now - _last_refresh_ok_ts, 1) if _last_refresh_ok_ts else None,
+                "last_refresh_error": _last_refresh_err,
+                **stats,
+            }
+            self._send(200 if n else 503, "application/json", json.dumps(body).encode())
+            return
 
         # ── /playlist.m3u ────────────────────────────────────────────────────
         if path in ("/playlist.m3u", "/"):
@@ -388,7 +454,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 return
             hdrs = dict(ch["headers"])
             name = ch['info'].split(',')[-1].strip()
-            print(f"[m3uproxy] TUNE {name}", flush=True)
+            log.info("TUNE %s", name)
             try:
                 t0 = time.monotonic()
                 data, final_url = _fetch(ch["url"], hdrs, STREAM_TIMEOUT)
@@ -396,12 +462,14 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 base = _resolve_base(ch["url"], final_url)
                 if b"#EXT" in data[:512]:
                     data = rewrite_m3u8(data, base, self.proxy_base(), hdrs)
-                    print(f"[m3uproxy] MASTER m3u8 {elapsed*1000:.0f}ms ({len(data)}B)", flush=True)
+                    log.info("MASTER m3u8 %.0fms (%dB)", elapsed * 1000, len(data))
                 else:
-                    print(f"[m3uproxy] STREAM {elapsed*1000:.0f}ms ({len(data)}B)", flush=True)
+                    log.info("STREAM %.0fms (%dB)", elapsed * 1000, len(data))
                 self._send(200, "application/x-mpegurl", data)
+                _bump("stream_ok")
             except Exception as e:
-                print(f"[m3uproxy] Stream {cid} error: {e}", flush=True)
+                log.error("Stream %s error: %s", cid, e)
+                _bump("stream_err")
                 if not self._started:
                     self._error(502)
             return
@@ -419,9 +487,11 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 self._proxy_segment(url, hdrs)
                 elapsed = time.monotonic() - t0
                 label = "CHUNK" if url.endswith(".m3u8") or url.endswith(".m3u") else "SEG"
-                print(f"[m3uproxy] {label} {elapsed*1000:.0f}ms {url.split('/')[-1].split('?')[0]}", flush=True)
+                log.info("%s %.0fms %s", label, elapsed * 1000, url.split('/')[-1].split('?')[0])
+                _bump("fetch_ok")
             except Exception as e:
-                print(f"[m3uproxy] Fetch error {url}: {e}", flush=True)
+                log.error("Fetch error %s: %s", url, e)
+                _bump("fetch_err")
                 if not self._started:
                     self._error(502)
             return
@@ -507,7 +577,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     # desync a kept-alive socket; do not attempt a second response.
                     self.close_connection = True
                     r.drain_conn()
-                    print(f"[m3uproxy] stream aborted mid-body: {type(e).__name__}: {e}", flush=True)
+                    log.warning("stream aborted mid-body: %s: %s", type(e).__name__, e)
         except Exception:
             r.drain_conn()
             raise
@@ -518,16 +588,25 @@ class ProxyHandler(BaseHTTPRequestHandler):
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
+    logging.basicConfig(
+        level=getattr(logging, LOG_LEVEL.upper(), logging.INFO),
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        stream=sys.stdout,
+    )
+
     if not M3U_URL:
-        print("[m3uproxy] WARNING: M3U_URL is not set", flush=True)
+        log.warning("M3U_URL is not set")
+
+    log.info("m3uproxy v%s starting", __version__)
+    log.info("config: M3U_URL host=%s | playlist_ttl=%ss | chunklist_ttl=%ss | "
+             "pool num_pools=%d maxsize=%d | max_concurrent=%s | client_timeout=%ss | log_level=%s",
+             _safe_host(M3U_URL) or "(unset)", PLAYLIST_TTL, CHUNKLIST_TTL,
+             POOL_NUM_POOLS, POOL_MAXSIZE, MAX_CONCURRENT or "unlimited", CLIENT_TIMEOUT, LOG_LEVEL)
 
     refresh_playlist()
 
     threading.Thread(target=_background_refresher, daemon=True, name="playlist-refresher").start()
 
     server = ThreadingHTTPServer((HOST, PORT), ProxyHandler)
-    print(f"[m3uproxy] v{__version__} listening on {HOST}:{PORT}", flush=True)
-    print(f"[m3uproxy] pool num_pools={POOL_NUM_POOLS} maxsize={POOL_MAXSIZE} | "
-          f"chunklist_ttl={CHUNKLIST_TTL}s | max_concurrent={MAX_CONCURRENT or 'unlimited'} | "
-          f"client_timeout={CLIENT_TIMEOUT}s", flush=True)
+    log.info("listening on %s:%d", HOST, PORT)
     server.serve_forever()
