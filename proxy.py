@@ -14,6 +14,7 @@ import sys
 import threading
 import time
 import urllib.parse
+from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import urllib3
@@ -57,6 +58,26 @@ POOL_MAXSIZE     = _envint("POOL_MAXSIZE",     32)     # keep-alive conns kept p
 MAX_CONCURRENT   = _envint("MAX_CONCURRENT",   0)      # in-flight request cap (0 = unlimited)
 CLIENT_TIMEOUT   = _envint("CLIENT_TIMEOUT",   30)     # idle keep-alive socket timeout (seconds)
 LOG_LEVEL        = os.environ.get("LOG_LEVEL", "INFO")
+LOGS_ENDPOINT    = os.environ.get("LOGS_ENDPOINT", "0") == "1"  # expose GET /logs (opt-in)
+LOG_RING_MAX     = _envint("LOG_RING_MAX", 300)                 # recent log lines kept for /logs
+
+# In-memory ring buffer of recent log lines, surfaced by the opt-in GET /logs endpoint
+# (so logs are reachable over HTTP without a shell on the host).
+_log_ring: deque = deque(maxlen=LOG_RING_MAX)
+
+
+class _RingHandler(logging.Handler):
+    def emit(self, record):
+        try:
+            _log_ring.append(self.format(record))
+        except Exception:
+            pass
+
+
+_ring_handler = _RingHandler()
+_ring_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+log.addHandler(_ring_handler)
+log.setLevel(getattr(logging, LOG_LEVEL.upper(), logging.INFO))
 
 # ---------------------------------------------------------------------------
 # Connection pool  (shared across all threads)
@@ -358,7 +379,10 @@ class ProxyHandler(BaseHTTPRequestHandler):
     _started = False
 
     def log_message(self, fmt, *args):
-        log.info("%s – %s", self.address_string(), fmt % args)
+        # Strip query strings from the logged request line: the proxied /fetch URLs carry
+        # Referer/Origin/User-Agent values that can be provider tokens. Keep path only.
+        msg = re.sub(r"\?\S*", "?…", fmt % args)
+        log.info("%s – %s", self.address_string(), msg)
 
     def proxy_base(self) -> str:
         host = self.headers.get("Host", f"127.0.0.1:{PORT}")
@@ -393,8 +417,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
         # Optional cap on concurrently-PROCESSING requests. Past the cap, shed load: fail
         # fast (non-blocking, so no thread parks waiting) and close the connection so the
         # client doesn't immediately retry on the same socket. Off unless MAX_CONCURRENT set.
-        # /health bypasses the cap so monitoring stays truthful even under load.
-        if _sem is None or urllib.parse.urlparse(self.path).path == "/health":
+        # /health and /logs bypass the cap so monitoring stays truthful even under load.
+        if _sem is None or urllib.parse.urlparse(self.path).path in ("/health", "/logs"):
             self._handle()
             return
         if not _sem.acquire(blocking=False):
@@ -431,6 +455,18 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 **stats,
             }
             self._send(200 if n else 503, "application/json", json.dumps(body).encode())
+            return
+
+        # ── /logs (opt-in via LOGS_ENDPOINT) ─────────────────────────────────
+        if path == "/logs":
+            if not LOGS_ENDPOINT:
+                self._error(404)
+                return
+            lines = list(_log_ring)
+            tail = query.get("tail", [None])[0]
+            if tail and tail.isdigit():
+                lines = lines[-int(tail):]
+            self._send(200, "text/plain; charset=utf-8", ("\n".join(lines) + "\n").encode())
             return
 
         # ── /playlist.m3u ────────────────────────────────────────────────────
@@ -490,7 +526,9 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 log.info("%s %.0fms %s", label, elapsed * 1000, url.split('/')[-1].split('?')[0])
                 _bump("fetch_ok")
             except Exception as e:
-                log.error("Fetch error %s: %s", url, e)
+                # Log host + filename only — the full URL/query may carry CDN tokens.
+                log.error("Fetch error %s …/%s: %s",
+                          _safe_host(url), url.split("?")[0].rsplit("/", 1)[-1], e)
                 _bump("fetch_err")
                 if not self._started:
                     self._error(502)

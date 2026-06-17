@@ -7,3 +7,9 @@ services:
     env_file:
       - .env
     restart: unless-stopped
+    # Cap log disk usage so per-request lines can't fill the NAS over time.
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
