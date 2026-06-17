@@ -1,0 +1,9 @@
+[tool.ruff]
+target-version = "py312"
+# Use Ruff's default rule set (pycodestyle E4/E7/E9 + Pyflakes F). Pyflakes F841
+# catches assigned-but-unused locals — the exact shape of the `_header` global bug.
+
+[tool.ruff.lint]
+# Only a bare `_` is a throwaway; named placeholders like `_header` must be used,
+# so an unused local that shadows an intended global gets flagged as F841.
+dummy-variable-rgx = "^_$"
