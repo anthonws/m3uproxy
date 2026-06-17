@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- `GET /health` endpoint returning JSON (`ok`, `version`, `channels`, `cache_age_s`,
+  `last_refresh_ok_age_s`, `last_refresh_error`, and `stream_ok/err` + `fetch_ok/err`
+  counters). Returns `503` when the cache is empty so it doubles as a container
+  healthcheck; exempt from `MAX_CONCURRENT` so monitoring stays truthful under load.
+- Structured logging via the stdlib `logging` module (timestamp + level + message on
+  stdout); `LOG_LEVEL` env var (default `INFO`). Replaces ad-hoc `print()` calls.
+- Startup config banner logging effective settings; the upstream URL is logged by host
+  only (never its path/query, which may carry tokens).
+- Integer env vars are validated at startup — a non-numeric value exits with a clear
+  `FATAL` message instead of an opaque traceback.
 - HTTP/1.1 client keep-alive: the media server now reuses one TCP connection for the
   many segment requests of a stream instead of reconnecting each time. All response
   paths are framed (Content-Length, or `Connection: close` for length-less streamed
@@ -19,7 +29,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Optional cap on concurrently-processing requests `MAX_CONCURRENT` (default 0 = unlimited):
   a coarse load-shed that returns a fast `503` and closes the connection past the limit.
   (Idle keep-alive connections are bounded separately by `CLIENT_TIMEOUT`.)
-- Effective connection/cache config is logged at startup.
 - Chunklist micro-cache (`CHUNKLIST_TTL`, default 2s): concurrent viewers of the
   same channel now share one upstream chunklist fetch per TTL window instead of
   re-fetching on every poll. Raw bytes are cached and the per-request rewrite still
