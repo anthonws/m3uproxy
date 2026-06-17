@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- HTTP/1.1 client keep-alive: the media server now reuses one TCP connection for the
+  many segment requests of a stream instead of reconnecting each time. All response
+  paths are framed (Content-Length, or `Connection: close` for length-less streamed
+  segments) so a kept-alive socket cannot desync. If a streamed segment fails after its
+  headers were sent (upstream drop, short read, client disconnect), the connection is
+  closed rather than left promising bytes it can't deliver. Idle connections are reaped
+  after `CLIENT_TIMEOUT` (default 30s) so they don't pin a thread.
+- Configurable connection pool: `POOL_MAXSIZE` (default 32) and `POOL_NUM_POOLS`
+  (default 20), with tuning guidance in the README for larger deployments.
+- Optional cap on concurrently-processing requests `MAX_CONCURRENT` (default 0 = unlimited):
+  a coarse load-shed that returns a fast `503` and closes the connection past the limit.
+  (Idle keep-alive connections are bounded separately by `CLIENT_TIMEOUT`.)
+- Effective connection/cache config is logged at startup.
 - Chunklist micro-cache (`CHUNKLIST_TTL`, default 2s): concurrent viewers of the
   same channel now share one upstream chunklist fetch per TTL window instead of
   re-fetching on every poll. Raw bytes are cached and the per-request rewrite still

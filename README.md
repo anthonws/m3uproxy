@@ -64,6 +64,32 @@ delimiter, which can silently truncate unquoted values.
 | `PLAYLIST_TIMEOUT` | `20`    | Playlist fetch timeout (seconds)                    |
 | `FETCH_RETRIES`    | `2`     | Retries on transient upstream errors                |
 | `CHUNKLIST_TTL`    | `2`     | Seconds to cache HLS chunklists; `0` disables        |
+| `POOL_MAXSIZE`     | `32`    | Keep-alive connections kept per upstream host       |
+| `POOL_NUM_POOLS`   | `20`    | Number of distinct upstream hosts pooled            |
+| `MAX_CONCURRENT`   | `0`     | Cap on in-flight requests; `0` = unlimited          |
+| `CLIENT_TIMEOUT`   | `30`    | Seconds an idle keep-alive client connection is held |
+
+### Tuning for larger deployments
+
+The defaults target a home setup feeding a single media server (a handful of concurrent
+streams). They are safe to leave as-is — `POOL_MAXSIZE=32` already covers far more
+concurrency than a few users generate.
+
+If you serve **many** concurrent streams (e.g. sharing with friends, or one channel pulled
+by many clients at once):
+
+- **`POOL_MAXSIZE`** — raise it if many streams hit the *same* upstream host simultaneously;
+  it bounds how many keep-alive connections are reused per host before extras are opened and
+  discarded. A rough guide: set it at or above your expected peak concurrent streams per host.
+- **`MAX_CONCURRENT`** — set a positive cap (e.g. `100`) to bound how many requests are
+  *processed* at once: requests past the cap get a fast `503` (and the connection is closed)
+  instead of all being served concurrently. Leave `0` to disable. Note: this caps in-flight
+  requests, not open connections — idle keep-alive connections are bounded by `CLIENT_TIMEOUT`.
+- **`CLIENT_TIMEOUT`** — lower it if idle clients hold connections open too long; raise it if
+  clients reconnect more often than you'd like.
+
+These are I/O-light: each idle pooled connection is a socket plus small buffers, so even
+generous values cost only kilobytes.
 
 ## Supported Headers
 

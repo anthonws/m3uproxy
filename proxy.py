@@ -33,15 +33,25 @@ FETCH_RETRIES    = int(os.environ.get("FETCH_RETRIES",    "2"))    # retries on 
 CHUNKLIST_TTL    = int(os.environ.get("CHUNKLIST_TTL",    "2"))    # seconds to cache a chunklist (0 disables)
 CHUNK_SIZE       = 128 * 1024                                       # 128 KB streaming chunks
 SEG_CACHE_MAX    = 500                                              # max cached chunklists (memory bound)
+POOL_NUM_POOLS   = int(os.environ.get("POOL_NUM_POOLS",   "20"))   # distinct upstream hosts pooled
+POOL_MAXSIZE     = int(os.environ.get("POOL_MAXSIZE",     "32"))   # keep-alive conns kept per upstream host
+MAX_CONCURRENT   = int(os.environ.get("MAX_CONCURRENT",   "0"))    # in-flight request cap (0 = unlimited)
+CLIENT_TIMEOUT   = int(os.environ.get("CLIENT_TIMEOUT",   "30"))   # idle keep-alive socket timeout (seconds)
 
 # ---------------------------------------------------------------------------
 # Connection pool  (shared across all threads)
 # ---------------------------------------------------------------------------
 _pool = urllib3.PoolManager(
-    num_pools=20,
-    maxsize=10,
+    num_pools=POOL_NUM_POOLS,
+    maxsize=POOL_MAXSIZE,
+    block=False,  # never block a request waiting for a pooled slot; spill extra conns
     retries=urllib3.Retry(total=False, redirect=10),
 )
+
+# Optional cap on the number of requests PROCESSING concurrently (not open connections
+# or threads — idle keep-alive connections are bounded by CLIENT_TIMEOUT reaping them).
+# A coarse load-shed: requests past the cap get a fast 503. Off by default.
+_sem = threading.BoundedSemaphore(MAX_CONCURRENT) if MAX_CONCURRENT > 0 else None
 
 # ---------------------------------------------------------------------------
 # Playlist cache
@@ -291,6 +301,13 @@ def _ensure_channels() -> tuple[dict, str]:
 
 class ProxyHandler(BaseHTTPRequestHandler):
 
+    # HTTP/1.1 enables client keep-alive (Emby reuses one TCP connection for the many
+    # segment requests of a stream). Correct framing is mandatory: every response must
+    # carry a Content-Length or close the connection, or a kept-alive socket desyncs.
+    protocol_version = "HTTP/1.1"
+    # Reap idle kept-alive connections so they don't pin a thread indefinitely.
+    timeout = CLIENT_TIMEOUT
+
     # Set True once a response (status line + headers) has begun, so error paths
     # know not to emit a second HTTP status line over an in-flight response.
     _started = False
@@ -311,17 +328,41 @@ class ProxyHandler(BaseHTTPRequestHandler):
         if self.command != "HEAD":
             try:
                 self.wfile.write(data)
-            except (BrokenPipeError, ConnectionResetError):
-                pass  # client went away mid-response
+            except Exception:
+                # Body partially written: never reuse a possibly-desynced keep-alive
+                # socket (covers client disconnect and any other write error).
+                self.close_connection = True
 
-    def _error(self, code: int) -> None:
+    def _error(self, code: int, close: bool = False) -> None:
+        self._started = True
         self.send_response(code)
+        self.send_header("Content-Length", "0")  # frame the empty body for keep-alive
+        if close:
+            self.send_header("Connection", "close")  # also sets self.close_connection
         self.end_headers()
 
     def do_HEAD(self):
         self.do_GET()
 
     def do_GET(self):
+        # Optional cap on concurrently-PROCESSING requests. Past the cap, shed load: fail
+        # fast (non-blocking, so no thread parks waiting) and close the connection so the
+        # client doesn't immediately retry on the same socket. Off unless MAX_CONCURRENT set.
+        if _sem is None:
+            self._handle()
+            return
+        if not _sem.acquire(blocking=False):
+            self._error(503, close=True)
+            return
+        try:
+            self._handle()
+        finally:
+            _sem.release()
+
+    def _handle(self):
+        # One handler instance serves multiple requests on a kept-alive connection,
+        # so reset per-request state that error paths rely on.
+        self._started = False
         parsed = urllib.parse.urlparse(self.path)
         path   = parsed.path
         query  = urllib.parse.parse_qs(parsed.query)
@@ -444,6 +485,11 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 self.send_header("Content-Type", "video/mp2t")
                 if cl := r.headers.get("Content-Length"):
                     self.send_header("Content-Length", cl)
+                else:
+                    # No upstream length: we can't frame the body, so close the
+                    # connection after it to keep a kept-alive socket in sync.
+                    self.send_header("Connection", "close")
+                    self.close_connection = True
                 self.end_headers()
                 self._started = True
                 try:
@@ -452,7 +498,16 @@ class ProxyHandler(BaseHTTPRequestHandler):
                         self.wfile.write(chunk)
                     r.release_conn()
                 except (BrokenPipeError, ConnectionResetError):
-                    r.drain_conn()  # client disconnected; close upstream cleanly
+                    # Client went away mid-stream; the connection is spent.
+                    self.close_connection = True
+                    r.drain_conn()
+                except Exception as e:
+                    # Headers (incl. Content-Length) are already sent — a failure here
+                    # leaves fewer bytes than promised. Close the connection rather than
+                    # desync a kept-alive socket; do not attempt a second response.
+                    self.close_connection = True
+                    r.drain_conn()
+                    print(f"[m3uproxy] stream aborted mid-body: {type(e).__name__}: {e}", flush=True)
         except Exception:
             r.drain_conn()
             raise
@@ -472,4 +527,7 @@ if __name__ == "__main__":
 
     server = ThreadingHTTPServer((HOST, PORT), ProxyHandler)
     print(f"[m3uproxy] v{__version__} listening on {HOST}:{PORT}", flush=True)
+    print(f"[m3uproxy] pool num_pools={POOL_NUM_POOLS} maxsize={POOL_MAXSIZE} | "
+          f"chunklist_ttl={CHUNKLIST_TTL}s | max_concurrent={MAX_CONCURRENT or 'unlimited'} | "
+          f"client_timeout={CLIENT_TIMEOUT}s", flush=True)
     server.serve_forever()
