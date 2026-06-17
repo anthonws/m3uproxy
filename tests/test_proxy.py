@@ -125,5 +125,33 @@ class ResolveBaseTest(unittest.TestCase):
         self.assertEqual(base, "https://cdn2.example/x/y/")
 
 
+class ChunklistCacheTest(unittest.TestCase):
+    def setUp(self):
+        self._orig_ttl = proxy.CHUNKLIST_TTL
+        proxy._seg_cache.clear()
+
+    def tearDown(self):
+        proxy.CHUNKLIST_TTL = self._orig_ttl
+        proxy._seg_cache.clear()
+
+    def test_hit_within_ttl_then_miss_after(self):
+        proxy.CHUNKLIST_TTL = 2
+        proxy._chunklist_cache_put("u", b"raw", "http://b/", now=100.0)
+        self.assertEqual(proxy._chunklist_cache_get("u", now=101.0), (b"raw", "http://b/"))
+        self.assertIsNone(proxy._chunklist_cache_get("u", now=103.0))  # past TTL
+
+    def test_ttl_zero_disables_cache(self):
+        proxy.CHUNKLIST_TTL = 0
+        proxy._chunklist_cache_put("u", b"raw", "http://b/", now=100.0)
+        self.assertEqual(len(proxy._seg_cache), 0)
+        self.assertIsNone(proxy._chunklist_cache_get("u", now=100.0))
+
+    def test_size_is_bounded(self):
+        proxy.CHUNKLIST_TTL = 60
+        for i in range(proxy.SEG_CACHE_MAX + 50):
+            proxy._chunklist_cache_put(f"u{i}", b"x", "http://b/", now=1.0)
+        self.assertLessEqual(len(proxy._seg_cache), proxy.SEG_CACHE_MAX)
+
+
 if __name__ == "__main__":
     unittest.main()
