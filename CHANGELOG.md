@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- Docker `HEALTHCHECK` that probes `/health` (honors `PROXY_PORT`), so container health
+  shows in `docker ps` / Synology Container Manager.
+- Log rotation in `docker-compose.yml` (`json-file`, `max-size: 10m`, `max-file: 3`) so
+  per-request logs can't fill the host disk over time.
+- Opt-in `GET /logs` endpoint (`LOGS_ENDPOINT=1`, off by default) returning the last
+  `LOG_RING_MAX` (300) log lines as plain text, with `?tail=N` support — useful when there
+  is no shell on the host. Query strings are stripped from logged request lines so
+  per-channel `Referer`/`Origin`/`User-Agent` tokens are not recorded; the `/fetch` error
+  log records host + filename only.
 - `GET /health` endpoint returning JSON (`ok`, `version`, `channels`, `cache_age_s`,
   `last_refresh_ok_age_s`, `last_refresh_error`, and `stream_ok/err` + `fetch_ok/err`
   counters). Returns `503` when the cache is empty so it doubles as a container
