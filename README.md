@@ -60,10 +60,12 @@ delimiter, which can silently truncate unquoted values.
 | `DEFAULT_UA`       | Firefox Linux UA | Default User-Agent                         |
 | `PLAYLIST_TTL`     | `86400` | Seconds between background playlist refreshes       |
 | `CONNECT_TIMEOUT`  | `5`     | TCP connect timeout (seconds)                       |
-| `STREAM_TIMEOUT`   | `10`    | Per-segment read timeout (seconds)                  |
+| `STREAM_TIMEOUT`   | `10`    | Per-segment **read** timeout — max gap between bytes |
+| `SEGMENT_TIMEOUT`  | `20`    | Total wall-clock per segment; aborts a trickling stream (`0` disables) |
 | `PLAYLIST_TIMEOUT` | `20`    | Playlist fetch timeout (seconds)                    |
 | `FETCH_RETRIES`    | `2`     | Retries on transient upstream errors                |
 | `CHUNKLIST_TTL`    | `2`     | Seconds to cache HLS chunklists; `0` disables        |
+| `CHUNKLIST_STALE_TTL` | `15` | Serve last-good chunklist this long past TTL on upstream error (`0` disables) |
 | `POOL_MAXSIZE`     | `32`    | Keep-alive connections kept per upstream host       |
 | `POOL_NUM_POOLS`   | `20`    | Number of distinct upstream hosts pooled            |
 | `MAX_CONCURRENT`   | `0`     | Cap on in-flight requests; `0` = unlimited          |
@@ -133,6 +135,22 @@ GET /logs?tail=50    # last 50 lines
 Query strings are stripped from logged request lines, so the per-channel `Referer`/
 `Origin`/`User-Agent` values are not recorded. **`/logs` is still unauthenticated like the
 rest of the proxy — keep it LAN-only.** It is disabled by default (`404`).
+
+## Flaky upstreams
+
+Free/overloaded CDNs sometimes trickle a segment for a minute or return `503` bursts,
+which can freeze the player. Two knobs limit the damage (both on by default):
+
+- **`SEGMENT_TIMEOUT`** (20s) bounds the *total* time spent streaming one segment. The
+  per-read timeout (`STREAM_TIMEOUT`) only catches a fully stalled connection; a slow
+  trickle keeps dodging it and can hang for a minute. When the total deadline is hit the
+  proxy aborts and closes the connection so the player retries instead of freezing.
+- **`CHUNKLIST_STALE_TTL`** (15s) lets the proxy serve the last-good chunklist for a short
+  grace window when the upstream errors, riding out brief blips instead of dropping the
+  stream. (It can't help when the whole CDN is down — there are no fresh segments to fetch.)
+
+Neither makes an unreliable source reliable; they make failures fast and recoverable
+rather than a frozen image. A channel that errors *constantly* is dead at the source.
 
 ## Supported Headers
 
