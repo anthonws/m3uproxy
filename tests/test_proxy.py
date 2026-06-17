@@ -4,10 +4,14 @@ Importing the module is side-effect free (the server only starts under
 ``if __name__ == "__main__"``), so these run with no network access.
 """
 
+import http.client
 import os
+import socket
 import sys
+import threading
 import unittest
 import urllib.parse
+from http.server import ThreadingHTTPServer
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -151,6 +155,143 @@ class ChunklistCacheTest(unittest.TestCase):
         for i in range(proxy.SEG_CACHE_MAX + 50):
             proxy._chunklist_cache_put(f"u{i}", b"x", "http://b/", now=1.0)
         self.assertLessEqual(len(proxy._seg_cache), proxy.SEG_CACHE_MAX)
+
+
+class KeepAliveFramingTest(unittest.TestCase):
+    """Integration test on a real server: HTTP/1.1 responses must be framed so a
+    kept-alive connection can be reused. A missing Content-Length would desync the
+    socket and the second request on the same connection would hang/fail."""
+
+    @classmethod
+    def setUpClass(cls):
+        proxy._channels = {"1": {"info": "#EXTINF:-1,Test", "url": "http://x/s.m3u8",
+                                 "headers": {}, "extra": []}}
+        proxy._header = "#EXTM3U"
+        proxy._cache_ts = 1.0
+        cls.srv = ThreadingHTTPServer(("127.0.0.1", 0), proxy.ProxyHandler)
+        cls.port = cls.srv.server_address[1]
+        cls.th = threading.Thread(target=cls.srv.serve_forever, daemon=True)
+        cls.th.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.srv.shutdown()
+        cls.srv.server_close()
+
+    def test_keepalive_reuses_one_connection(self):
+        c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        c.request("GET", "/playlist.m3u")
+        r1 = c.getresponse()
+        b1 = r1.read()
+        self.assertEqual(r1.status, 200)
+        self.assertEqual(r1.version, 11)  # HTTP/1.1
+        self.assertIsNotNone(r1.getheader("Content-Length"))
+        # Second request on the SAME socket — only works if framing was correct.
+        c.request("GET", "/playlist.m3u")
+        r2 = c.getresponse()
+        b2 = r2.read()
+        self.assertEqual(r2.status, 200)
+        self.assertEqual(b1, b2)
+        c.close()
+
+    def test_error_is_framed_and_keeps_connection_alive(self):
+        c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        c.request("GET", "/does-not-exist")
+        r1 = c.getresponse()
+        r1.read()
+        self.assertEqual(r1.status, 404)
+        self.assertEqual(r1.getheader("Content-Length"), "0")
+        # Connection must still be usable after an error response.
+        c.request("GET", "/playlist.m3u")
+        r2 = c.getresponse()
+        r2.read()
+        self.assertEqual(r2.status, 200)
+        c.close()
+
+    def test_concurrency_cap_returns_503_and_closes(self):
+        # Exhaust an injected semaphore so the next request is shed.
+        sem = threading.BoundedSemaphore(1)
+        sem.acquire()
+        orig = proxy._sem
+        proxy._sem = sem
+        try:
+            c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+            c.request("GET", "/playlist.m3u")
+            r = c.getresponse()
+            r.read()
+            self.assertEqual(r.status, 503)
+            self.assertEqual(r.getheader("Content-Length"), "0")
+            self.assertEqual((r.getheader("Connection") or "").lower(), "close")
+            c.close()
+        finally:
+            proxy._sem = orig
+            sem.release()
+
+    def test_truncated_upstream_stream_closes_connection(self):
+        # Upstream advertises a large Content-Length but drops mid-stream. The server
+        # must close the connection (not keep it alive promising bytes it can't send).
+        class _FakeResp:
+            def __init__(self):
+                self.status = 200
+                self.headers = {"Content-Type": "video/mp2t", "Content-Length": "100000"}
+                self._body = b"\x47" + b"\x00" * 1023  # not an m3u8
+                self._pos = 0
+            def read(self, n=None):
+                end = len(self._body) if n is None else self._pos + n
+                c = self._body[self._pos:end]
+                self._pos += len(c)
+                return c
+            def stream(self, _sz):
+                yield self._body[self._pos:]            # one short chunk...
+                raise OSError("simulated upstream drop")  # ...then upstream fails
+            def release_conn(self): pass
+            def drain_conn(self): pass
+            def geturl(self): return None
+
+        class _FakePool:
+            def request(self, *a, **k):
+                return _FakeResp()
+
+        orig = proxy._pool
+        proxy._pool = _FakePool()
+        try:
+            s = socket.create_connection(("127.0.0.1", self.port), timeout=3)
+            s.sendall(b"GET /fetch?url=http%3A%2F%2Fx%2Fseg.ts HTTP/1.1\r\nHost: x\r\n\r\n")
+            s.settimeout(3)
+            got_eof = False
+            data = b""
+            while True:
+                try:
+                    chunk = s.recv(65536)
+                except socket.timeout:
+                    break  # server kept the connection open -> desync (fix absent)
+                if chunk == b"":
+                    got_eof = True
+                    break
+                data += chunk
+            s.close()
+            self.assertTrue(data.startswith(b"HTTP/1.1 200"))
+            self.assertTrue(got_eof, "server must close the connection after a truncated stream")
+        finally:
+            proxy._pool = orig
+
+    def test_started_flag_resets_between_keepalive_requests(self):
+        # A success then a failing request on the SAME connection: the failure must
+        # still send its 502. Regression guard for the per-instance _started flag
+        # leaking across kept-alive requests.
+        orig = proxy._fetch
+        proxy._fetch = lambda *a, **k: (_ for _ in ()).throw(OSError("boom"))
+        try:
+            c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+            c.request("GET", "/playlist.m3u")      # success -> sets _started True
+            c.getresponse().read()
+            c.request("GET", "/stream/1")          # _fetch raises -> must emit 502
+            r2 = c.getresponse()
+            r2.read()
+            self.assertEqual(r2.status, 502)
+            c.close()
+        finally:
+            proxy._fetch = orig
 
 
 if __name__ == "__main__":
