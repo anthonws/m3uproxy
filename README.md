@@ -71,6 +71,8 @@ delimiter, which can silently truncate unquoted values.
 | `LOG_LEVEL`        | `INFO`  | Log verbosity (`DEBUG`/`INFO`/`WARNING`/`ERROR`)    |
 | `LOGS_ENDPOINT`    | `0`     | Set `1` to expose recent logs at `GET /logs`        |
 | `LOG_RING_MAX`     | `300`   | Recent log lines kept in memory for `/logs`         |
+| `TOKEN_INJECT`     | *(none)* | Rules to mint+inject a signed token for matching hosts (see below) |
+| `TOKEN_TTL`        | `30`    | Seconds to cache an injected token                  |
 
 ### Tuning for larger deployments
 
@@ -100,9 +102,9 @@ generous values cost only kilobytes.
 
 ```json
 {
-  "ok": true, "version": "1.5", "channels": 1037, "cache_age_s": 12.3,
+  "ok": true, "version": "1.6", "channels": 1037, "cache_age_s": 12.3,
   "last_refresh_ok_age_s": 12.3, "last_refresh_error": null,
-  "last_request_error": "video-auth2.iol.pt …/chunks.m3u8: OSError: upstream HTTP 403",
+  "last_request_error": "cdn.example …/chunklist.m3u8: OSError: upstream HTTP 403",
   "stream_ok": 42, "stream_err": 0, "fetch_ok": 980, "fetch_err": 3
 }
 ```
@@ -139,6 +141,30 @@ Reads the following `#EXTVLCOPT` directives from the M3U:
 - `#EXTVLCOPT:http-referrer=`
 - `#EXTVLCOPT:http-user-agent=`
 - `#EXTVLCOPT:http-origin=`
+
+## Upstream token injection
+
+Some providers serve playlists whose segment/variant URLs require a **signed token** (a
+query parameter the playlist itself leaves blank) that must be minted from a separate
+endpoint. `TOKEN_INJECT` lets the proxy fetch such a token and add it to matching upstream
+requests — entirely server-side, so the token never reaches your media server or clients.
+
+```bash
+# host-glob | token-endpoint | query-param        (separate multiple rules with ;;)
+TOKEN_INJECT="cdn.example.com|https://token.example.com/mint|sig"
+```
+
+When the proxy is about to fetch an upstream URL whose host matches the glob and whose
+`<query-param>` is missing or empty, it fetches a token from the endpoint, caches it for
+`TOKEN_TTL` seconds (tokens are usually time-limited), and sets the parameter. URLs that
+already carry a value, or hosts that don't match, are left untouched. Off by default.
+
+The host-glob applies to **every** request on that host — master playlists, chunklists and
+segments alike. If your master endpoint is strict about unexpected parameters, scope the
+glob to the specific host that serves the signed media (e.g. `video-edge*.example.com`). A
+failing or slow token endpoint is probed at most once per cooldown (it won't block every
+request), and obvious non-token responses (HTML/JSON error pages) are rejected rather than
+cached.
 
 ## Tested With
 
