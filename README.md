@@ -63,6 +63,7 @@ delimiter, which can silently truncate unquoted values.
 | `STREAM_TIMEOUT`   | `10`    | Per-segment read timeout (seconds)                  |
 | `PLAYLIST_TIMEOUT` | `20`    | Playlist fetch timeout (seconds)                    |
 | `FETCH_RETRIES`    | `2`     | Retries on transient upstream errors                |
+| `CHUNKLIST_TTL`    | `2`     | Seconds to cache HLS chunklists; `0` disables        |
 
 ## Supported Headers
 

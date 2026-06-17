@@ -30,7 +30,9 @@ CONNECT_TIMEOUT  = int(os.environ.get("CONNECT_TIMEOUT",  "5"))    # TCP connect
 STREAM_TIMEOUT   = int(os.environ.get("STREAM_TIMEOUT",   "10"))   # per-segment read timeout
 PLAYLIST_TIMEOUT = int(os.environ.get("PLAYLIST_TIMEOUT", "20"))   # playlist fetch timeout
 FETCH_RETRIES    = int(os.environ.get("FETCH_RETRIES",    "2"))    # retries on transient errors
+CHUNKLIST_TTL    = int(os.environ.get("CHUNKLIST_TTL",    "2"))    # seconds to cache a chunklist (0 disables)
 CHUNK_SIZE       = 128 * 1024                                       # 128 KB streaming chunks
+SEG_CACHE_MAX    = 500                                              # max cached chunklists (memory bound)
 
 # ---------------------------------------------------------------------------
 # Connection pool  (shared across all threads)
@@ -49,6 +51,18 @@ _header: str = "#EXTM3U"
 _cache_ts: float = 0.0
 _cache_lock = threading.Lock()
 
+# ---------------------------------------------------------------------------
+# Chunklist micro-cache
+#
+# Live HLS chunklists are re-requested every few seconds by every viewer. Caching
+# the raw upstream bytes for a short TTL collapses concurrent polls of the same
+# channel into a single upstream fetch. We store the raw m3u8 plus the resolved
+# base URL and re-run the (cheap) per-request rewrite on a hit, so injected headers
+# and the proxy host stay correct per request. TS segments are never cached.
+# ---------------------------------------------------------------------------
+_seg_cache: dict = {}            # url -> (ts, raw_bytes, base_url)
+_seg_cache_lock = threading.Lock()
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -56,6 +70,27 @@ _cache_lock = threading.Lock()
 
 def _headers(extra: dict) -> dict:
     return {"User-Agent": UA, **extra}
+
+
+def _chunklist_cache_get(url: str, now: float) -> tuple[bytes, str] | None:
+    """Return (raw_bytes, base_url) for a fresh cached chunklist, else None."""
+    if CHUNKLIST_TTL <= 0:
+        return None
+    with _seg_cache_lock:
+        hit = _seg_cache.get(url)
+    if hit and now - hit[0] < CHUNKLIST_TTL:
+        return hit[1], hit[2]
+    return None
+
+
+def _chunklist_cache_put(url: str, raw: bytes, base: str, now: float) -> None:
+    """Cache raw chunklist bytes + resolved base, bounding the cache size."""
+    if CHUNKLIST_TTL <= 0:
+        return
+    with _seg_cache_lock:
+        if len(_seg_cache) >= SEG_CACHE_MAX and url not in _seg_cache:
+            _seg_cache.pop(next(iter(_seg_cache)))  # evict one arbitrary entry
+        _seg_cache[url] = (now, raw, base)
 
 
 def _fetch(url: str, extra_headers: dict, timeout: int) -> tuple[bytes, str]:
@@ -373,6 +408,16 @@ class ProxyHandler(BaseHTTPRequestHandler):
             self.end_headers()
             return
 
+        # Serve a fresh cached chunklist without touching upstream. Only chunklists
+        # are ever cached, so a hit unambiguously means an m3u8.
+        now = time.monotonic()
+        cached = _chunklist_cache_get(url, now)
+        if cached is not None:
+            raw, base = cached
+            self._send(200, "application/x-mpegurl",
+                       rewrite_m3u8(raw, base, self.proxy_base(), hdrs))
+            return
+
         r = _pool.request("GET", url, headers=h, timeout=t, preload_content=False)
         if r.status >= 400:
             r.drain_conn()
@@ -389,7 +434,9 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 rest = r.read()
                 r.release_conn()
                 base = _resolve_base(url, r.geturl())
-                data = rewrite_m3u8(peek + rest, base, self.proxy_base(), hdrs)
+                raw = peek + rest
+                _chunklist_cache_put(url, raw, base, now)
+                data = rewrite_m3u8(raw, base, self.proxy_base(), hdrs)
                 self._send(200, "application/x-mpegurl", data)
             else:
                 # TS segment: stream directly to client without buffering.
