@@ -346,6 +346,35 @@ class KeepAliveFramingTest(unittest.TestCase):
         finally:
             proxy.LOGS_ENDPOINT = orig
 
+    def test_upstream_error_is_counted_and_recorded(self):
+        # An upstream >=400 must surface as a counted fetch_err with the host recorded,
+        # not a silent 502 miscounted as success.
+        class _Resp403:
+            status = 403
+            headers = {}
+            def drain_conn(self):
+                pass
+
+        class _Pool:
+            def request(self, *a, **k):
+                return _Resp403()
+
+        orig = proxy._pool
+        before = proxy._stats["fetch_err"]
+        proxy._pool = _Pool()
+        try:
+            c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+            c.request("GET", "/fetch?url=http%3A%2F%2Fvideo-auth2.iol.pt%2Fx%2Fchunks.m3u8")
+            r = c.getresponse()
+            r.read()
+            self.assertEqual(r.status, 502)
+            c.close()
+            self.assertEqual(proxy._stats["fetch_err"], before + 1)
+            self.assertIn("403", proxy._last_request_err or "")
+            self.assertIn("video-auth2.iol.pt", proxy._last_request_err or "")
+        finally:
+            proxy._pool = orig
+
     def test_started_flag_resets_between_keepalive_requests(self):
         # A success then a failing request on the SAME connection: the failure must
         # still send its 502. Regression guard for the per-instance _started flag
