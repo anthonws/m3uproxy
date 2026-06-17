@@ -364,14 +364,14 @@ class KeepAliveFramingTest(unittest.TestCase):
         proxy._pool = _Pool()
         try:
             c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
-            c.request("GET", "/fetch?url=http%3A%2F%2Fvideo-auth2.iol.pt%2Fx%2Fchunks.m3u8")
+            c.request("GET", "/fetch?url=http%3A%2F%2Fcdn.example.com%2Fx%2Fchunks.m3u8")
             r = c.getresponse()
             r.read()
             self.assertEqual(r.status, 502)
             c.close()
             self.assertEqual(proxy._stats["fetch_err"], before + 1)
             self.assertIn("403", proxy._last_request_err or "")
-            self.assertIn("video-auth2.iol.pt", proxy._last_request_err or "")
+            self.assertIn("cdn.example.com", proxy._last_request_err or "")
         finally:
             proxy._pool = orig
 
@@ -416,7 +416,7 @@ class TokenInjectTest(unittest.TestCase):
     def setUp(self):
         self._rules = proxy._token_rules
         self._gettok = proxy._get_token
-        proxy._token_rules = [("video-auth*.example.com", "https://t.example/tok", "sig")]
+        proxy._token_rules = [("cdn*.example.com", "https://t.example/tok", "sig")]
         proxy._get_token = lambda ep: "TOK+EN/="  # base64-ish (has +, /, =)
 
     def tearDown(self):
@@ -424,27 +424,27 @@ class TokenInjectTest(unittest.TestCase):
         proxy._get_token = self._gettok
 
     def test_fills_empty_param_on_matching_host(self):
-        out = proxy._inject_token("https://video-auth2.example.com/x/chunks.m3u8?sig=")
-        self.assertEqual(out, "https://video-auth2.example.com/x/chunks.m3u8?sig=TOK%2BEN%2F%3D")
+        out = proxy._inject_token("https://cdn.example.com/x/chunks.m3u8?sig=")
+        self.assertEqual(out, "https://cdn.example.com/x/chunks.m3u8?sig=TOK%2BEN%2F%3D")
 
     def test_appends_param_when_absent(self):
-        out = proxy._inject_token("https://video-auth2.example.com/x/chunks.m3u8")
-        self.assertEqual(out, "https://video-auth2.example.com/x/chunks.m3u8?sig=TOK%2BEN%2F%3D")
+        out = proxy._inject_token("https://cdn.example.com/x/chunks.m3u8")
+        self.assertEqual(out, "https://cdn.example.com/x/chunks.m3u8?sig=TOK%2BEN%2F%3D")
 
     def test_appends_with_ampersand_when_other_params_present(self):
-        out = proxy._inject_token("https://video-auth2.example.com/x/chunks.m3u8?a=1")
-        self.assertEqual(out, "https://video-auth2.example.com/x/chunks.m3u8?a=1&sig=TOK%2BEN%2F%3D")
+        out = proxy._inject_token("https://cdn.example.com/x/chunks.m3u8?a=1")
+        self.assertEqual(out, "https://cdn.example.com/x/chunks.m3u8?a=1&sig=TOK%2BEN%2F%3D")
 
     def test_untouched_when_param_already_set(self):
-        u = "https://video-auth2.example.com/x/chunks.m3u8?sig=ALREADY"
+        u = "https://cdn.example.com/x/chunks.m3u8?sig=ALREADY"
         self.assertEqual(proxy._inject_token(u), u)
 
     def test_appends_before_fragment(self):
-        out = proxy._inject_token("https://video-auth2.example.com/x/chunks.m3u8#frag")
-        self.assertEqual(out, "https://video-auth2.example.com/x/chunks.m3u8?sig=TOK%2BEN%2F%3D#frag")
+        out = proxy._inject_token("https://cdn.example.com/x/chunks.m3u8#frag")
+        self.assertEqual(out, "https://cdn.example.com/x/chunks.m3u8?sig=TOK%2BEN%2F%3D#frag")
 
     def test_skips_when_a_later_duplicate_has_value(self):
-        u = "https://video-auth2.example.com/x/chunks.m3u8?sig=&sig=REAL"
+        u = "https://cdn.example.com/x/chunks.m3u8?sig=&sig=REAL"
         self.assertEqual(proxy._inject_token(u), u)
 
     def test_untouched_on_nonmatching_host(self):
@@ -453,7 +453,7 @@ class TokenInjectTest(unittest.TestCase):
 
     def test_noop_when_no_rules(self):
         proxy._token_rules = []
-        u = "https://video-auth2.example.com/x/chunks.m3u8?sig="
+        u = "https://cdn.example.com/x/chunks.m3u8?sig="
         self.assertEqual(proxy._inject_token(u), u)
 
     def test_parse_rules_skips_malformed(self):
