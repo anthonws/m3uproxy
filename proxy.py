@@ -6,7 +6,6 @@ Reads #EXTVLCOPT directives from M3U playlists and injects the correct
 Referer, User-Agent and Origin headers when proxying HLS streams.
 """
 
-import gzip
 import os
 import re
 import threading
@@ -15,6 +14,8 @@ import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import urllib3
+
+__version__ = "1.4"
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -57,8 +58,12 @@ def _headers(extra: dict) -> dict:
     return {"User-Agent": UA, **extra}
 
 
-def _fetch(url: str, extra_headers: dict, timeout: int) -> bytes:
-    """Fetch a URL fully into memory with retries and manual redirect following."""
+def _fetch(url: str, extra_headers: dict, timeout: int) -> tuple[bytes, str]:
+    """Fetch a URL fully into memory with retries and manual redirect following.
+
+    Returns (body, final_url) where final_url reflects any redirects followed, so
+    callers can resolve relative URLs against the location that actually served them.
+    """
     h = _headers(extra_headers)
     t = urllib3.Timeout(connect=CONNECT_TIMEOUT, read=timeout)
     last_exc: Exception | None = None
@@ -78,12 +83,14 @@ def _fetch(url: str, extra_headers: dict, timeout: int) -> bytes:
                     continue
                 break
 
+            if r.status in (301, 302, 303, 307, 308):
+                raise OSError("Too many redirects")
             if r.status >= 500 and attempt < FETCH_RETRIES:
                 time.sleep(0.5 * (attempt + 1))
                 continue
             if r.status >= 400:
                 raise OSError(f"HTTP {r.status}")
-            return r.data
+            return r.data, current_url
         except OSError:
             raise
         except Exception as e:
@@ -112,9 +119,11 @@ def parse_playlist(content: bytes) -> tuple[dict, str]:
         elif line.startswith("#EXTINF"):
             info = line
             hdrs: dict = {}
+            extra: list = []
             i += 1
             while i < len(lines) and lines[i].strip().startswith("#"):
                 opt = lines[i].strip()
+                matched = False
                 for key, pattern in [
                     ("Referer",    r"#EXTVLCOPT:http-referrer=(.+)"),
                     ("User-Agent", r"#EXTVLCOPT:http-user-agent=(.+)"),
@@ -123,11 +132,16 @@ def parse_playlist(content: bytes) -> tuple[dict, str]:
                     m = re.match(pattern, opt)
                     if m:
                         hdrs[key] = m.group(1).strip()
+                        matched = True
+                if not matched:
+                    # Preserve other per-channel tags (e.g. #EXTGRP) for the media server.
+                    extra.append(opt)
                 i += 1
             if i < len(lines):
                 url = lines[i].strip()
                 if url and not url.startswith("#"):
-                    channels[str(cid)] = {"info": info, "url": url, "headers": hdrs}
+                    channels[str(cid)] = {"info": info, "url": url,
+                                          "headers": hdrs, "extra": extra}
                     cid += 1
         i += 1
     return channels, header
@@ -137,19 +151,32 @@ def build_playlist(proxy_base: str, channels: dict, header: str) -> str:
     lines = [header]
     for cid, ch in channels.items():
         lines.append(ch["info"])
+        lines.extend(ch.get("extra", []))
         lines.append(f"{proxy_base}/stream/{cid}")
     return "\n".join(lines)
 
 
 def rewrite_m3u8(content: bytes, base_url: str, proxy_base: str, headers: dict) -> bytes:
     params = urllib.parse.urlencode(headers)
+
+    def _proxied(target: str) -> str:
+        abs_url = urllib.parse.urljoin(base_url, target)
+        encoded = urllib.parse.quote(abs_url, safe="")
+        return f"{proxy_base}/fetch?url={encoded}&{params}"
+
+    def _rewrite_uri_attr(m):
+        return f'URI="{_proxied(m.group(1))}"'
+
     result = []
     for line in content.decode("utf-8", errors="replace").splitlines():
         stripped = line.strip()
         if stripped and not stripped.startswith("#"):
-            abs_url = urllib.parse.urljoin(base_url, stripped)
-            encoded = urllib.parse.quote(abs_url, safe="")
-            result.append(f"{proxy_base}/fetch?url={encoded}&{params}")
+            # Segment / variant playlist URL.
+            result.append(_proxied(stripped))
+        elif stripped.startswith("#") and 'URI="' in stripped:
+            # Tag carrying a resource URI (#EXT-X-KEY/#EXT-X-MAP/#EXT-X-MEDIA): proxy it
+            # too so the AES key / init segment / alternate rendition gets header injection.
+            result.append(re.sub(r'URI="([^"]*)"', _rewrite_uri_attr, line))
         else:
             result.append(line)
     return "\n".join(result).encode("utf-8")
@@ -160,13 +187,13 @@ def rewrite_m3u8(content: bytes, base_url: str, proxy_base: str, headers: dict) 
 # ---------------------------------------------------------------------------
 
 def refresh_playlist() -> bool:
-    global _channels, _cache_ts
+    global _channels, _header, _cache_ts
     if not M3U_URL:
         print("[m3uproxy] ERROR: M3U_URL is not set", flush=True)
         return False
     print(f"[m3uproxy] Fetching playlist: {M3U_URL}", flush=True)
     try:
-        data = _fetch(M3U_URL, {}, PLAYLIST_TIMEOUT)
+        data, _ = _fetch(M3U_URL, {}, PLAYLIST_TIMEOUT)
         print(f"[m3uproxy] Fetched {len(data):,} bytes", flush=True)
         channels, header = parse_playlist(data)
         with _cache_lock:
@@ -218,6 +245,10 @@ def _ensure_channels() -> tuple[dict, str]:
 
 class ProxyHandler(BaseHTTPRequestHandler):
 
+    # Set True once a response (status line + headers) has begun, so error paths
+    # know not to emit a second HTTP status line over an in-flight response.
+    _started = False
+
     def log_message(self, fmt, *args):
         print(f"[m3uproxy] {self.address_string()} – {fmt % args}", flush=True)
 
@@ -226,12 +257,16 @@ class ProxyHandler(BaseHTTPRequestHandler):
         return f"http://{host.split(':')[0]}:{PORT}"
 
     def _send(self, code: int, content_type: str, data: bytes) -> None:
+        self._started = True
         self.send_response(code)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
         if self.command != "HEAD":
-            self.wfile.write(data)
+            try:
+                self.wfile.write(data)
+            except (BrokenPipeError, ConnectionResetError):
+                pass  # client went away mid-response
 
     def _error(self, code: int) -> None:
         self.send_response(code)
@@ -269,9 +304,9 @@ class ProxyHandler(BaseHTTPRequestHandler):
             print(f"[m3uproxy] TUNE {name}", flush=True)
             try:
                 t0 = time.monotonic()
-                data = _fetch(ch["url"], hdrs, STREAM_TIMEOUT)
+                data, final_url = _fetch(ch["url"], hdrs, STREAM_TIMEOUT)
                 elapsed = time.monotonic() - t0
-                base = ch["url"].rsplit("/", 1)[0] + "/"
+                base = final_url.rsplit("/", 1)[0] + "/"
                 if b"#EXT" in data[:512]:
                     data = rewrite_m3u8(data, base, self.proxy_base(), hdrs)
                     print(f"[m3uproxy] MASTER m3u8 {elapsed*1000:.0f}ms ({len(data)}B)", flush=True)
@@ -280,7 +315,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 self._send(200, "application/x-mpegurl", data)
             except Exception as e:
                 print(f"[m3uproxy] Stream {cid} error: {e}", flush=True)
-                self._error(502)
+                if not self._started:
+                    self._error(502)
             return
 
         # ── /fetch?url=... ───────────────────────────────────────────────────
@@ -299,7 +335,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 print(f"[m3uproxy] {label} {elapsed*1000:.0f}ms {url.split('/')[-1].split('?')[0]}", flush=True)
             except Exception as e:
                 print(f"[m3uproxy] Fetch error {url}: {e}", flush=True)
-                self._error(502)
+                if not self._started:
+                    self._error(502)
             return
 
         self._error(404)
@@ -317,6 +354,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
         if self.command == "HEAD":
             r = _pool.request("HEAD", url, headers=h, timeout=t, preload_content=False)
             r.drain_conn()
+            self._started = True
             self.send_response(200 if r.status < 400 else r.status)
             self.send_header("Content-Type", r.headers.get("Content-Type", "video/mp2t"))
             if cl := r.headers.get("Content-Length"):
@@ -335,11 +373,12 @@ class ProxyHandler(BaseHTTPRequestHandler):
             peek = r.read(512)
 
             if b"#EXT" in peek:
-                # Sub-playlist: buffer the rest and rewrite URLs.
+                # Sub-playlist: buffer the rest and rewrite URLs against the
+                # post-redirect URL so relative segment paths resolve correctly.
                 rest = r.read()
                 r.release_conn()
-                data = rewrite_m3u8(peek + rest, url.rsplit("/", 1)[0] + "/",
-                                    self.proxy_base(), hdrs)
+                base = (r.geturl() or url).rsplit("/", 1)[0] + "/"
+                data = rewrite_m3u8(peek + rest, base, self.proxy_base(), hdrs)
                 self._send(200, "application/x-mpegurl", data)
             else:
                 # TS segment: stream directly to client without buffering.
@@ -348,6 +387,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 if cl := r.headers.get("Content-Length"):
                     self.send_header("Content-Length", cl)
                 self.end_headers()
+                self._started = True
                 try:
                     self.wfile.write(peek)
                     for chunk in r.stream(CHUNK_SIZE):
@@ -373,5 +413,5 @@ if __name__ == "__main__":
     threading.Thread(target=_background_refresher, daemon=True, name="playlist-refresher").start()
 
     server = ThreadingHTTPServer((HOST, PORT), ProxyHandler)
-    print(f"[m3uproxy] Listening on {HOST}:{PORT}", flush=True)
+    print(f"[m3uproxy] v{__version__} listening on {HOST}:{PORT}", flush=True)
     server.serve_forever()
