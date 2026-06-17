@@ -6,7 +6,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- Upstream errors on `/fetch` (e.g. an expired or empty-token segment that the origin
+  rejects with `403`/`404`/`5xx`) were relayed as a **silent `502`** and miscounted as a
+  success. They are now logged with the real upstream status and host
+  (`Fetch error <host> …/<file>: upstream HTTP 403`) and counted as `fetch_err`.
+
+### Changed
+- Benign idle keep-alive disconnects (a client connection reaped after `CLIENT_TIMEOUT`)
+  are logged at `DEBUG` as `idle connection closed` instead of as alarming
+  `Request timed out: TimeoutError` lines; genuine handler errors now log at `WARNING`.
+
 ### Added
+- `/health` now includes `last_request_error` — the most recent `/stream` or `/fetch`
+  failure (host-scoped, no tokens) — so a bad channel is visible without scraping logs.
 - Docker `HEALTHCHECK` that probes `/health` (honors `PROXY_PORT`), so container health
   shows in `docker ps` / Synology Container Manager.
 - Log rotation in `docker-compose.yml` (`json-file`, `max-size: 10m`, `max-file: 3`) so
