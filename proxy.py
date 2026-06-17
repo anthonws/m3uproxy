@@ -101,6 +101,17 @@ def _fetch(url: str, extra_headers: dict, timeout: int) -> tuple[bytes, str]:
     raise last_exc  # type: ignore[misc]
 
 
+def _resolve_base(request_url: str, response_url: str | None) -> str:
+    """Directory base for resolving relative URLs in a playlist, honoring redirects.
+
+    ``response_url`` (e.g. urllib3's ``HTTPResponse.geturl()``) may be absolute when a
+    redirect was followed, or just a bare path for a non-redirected PoolManager request.
+    Joining it onto the absolute ``request_url`` yields a correct absolute base either way.
+    """
+    final = urllib.parse.urljoin(request_url, response_url or request_url)
+    return final.rsplit("/", 1)[0] + "/"
+
+
 # ---------------------------------------------------------------------------
 # Playlist parsing and building
 # ---------------------------------------------------------------------------
@@ -306,7 +317,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 t0 = time.monotonic()
                 data, final_url = _fetch(ch["url"], hdrs, STREAM_TIMEOUT)
                 elapsed = time.monotonic() - t0
-                base = final_url.rsplit("/", 1)[0] + "/"
+                base = _resolve_base(ch["url"], final_url)
                 if b"#EXT" in data[:512]:
                     data = rewrite_m3u8(data, base, self.proxy_base(), hdrs)
                     print(f"[m3uproxy] MASTER m3u8 {elapsed*1000:.0f}ms ({len(data)}B)", flush=True)
@@ -377,7 +388,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 # post-redirect URL so relative segment paths resolve correctly.
                 rest = r.read()
                 r.release_conn()
-                base = (r.geturl() or url).rsplit("/", 1)[0] + "/"
+                base = _resolve_base(url, r.geturl())
                 data = rewrite_m3u8(peek + rest, base, self.proxy_base(), hdrs)
                 self._send(200, "application/x-mpegurl", data)
             else:
