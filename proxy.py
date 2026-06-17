@@ -20,7 +20,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import urllib3
 
-__version__ = "1.6"
+__version__ = "1.7.0"
 
 log = logging.getLogger("m3uproxy")
 
