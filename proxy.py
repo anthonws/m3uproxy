@@ -6,6 +6,7 @@ Reads #EXTVLCOPT directives from M3U playlists and injects the correct
 Referer, User-Agent and Origin headers when proxying HLS streams.
 """
 
+import fnmatch
 import json
 import logging
 import os
@@ -19,7 +20,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import urllib3
 
-__version__ = "1.5"
+__version__ = "1.6"
 
 log = logging.getLogger("m3uproxy")
 
@@ -35,6 +36,26 @@ def _envint(name: str, default: int) -> int:
         # logging isn't configured yet at config-parse time; print the fatal directly.
         print(f"[m3uproxy] FATAL: {name} must be an integer, got {raw!r}", flush=True)
         sys.exit(1)
+
+
+def _parse_token_rules(spec: str) -> list:
+    """Parse TOKEN_INJECT into [(host_glob, token_endpoint, param), ...].
+
+    Format: 'host-glob|token-endpoint|query-param', multiple rules separated by ';;'.
+    Lets an operator make the proxy mint and inject a signed token (e.g. a URL-signing
+    token a provider serves blank) without any provider-specific code.
+    """
+    rules = []
+    for raw in spec.split(";;"):
+        raw = raw.strip()
+        if not raw:
+            continue
+        parts = [p.strip() for p in raw.split("|")]
+        if len(parts) != 3 or not all(parts):
+            print(f"[m3uproxy] WARNING: ignoring malformed TOKEN_INJECT rule: {raw!r}", flush=True)
+            continue
+        rules.append((parts[0], parts[1], parts[2]))
+    return rules
 
 
 # ---------------------------------------------------------------------------
@@ -60,6 +81,9 @@ CLIENT_TIMEOUT   = _envint("CLIENT_TIMEOUT",   30)     # idle keep-alive socket 
 LOG_LEVEL        = os.environ.get("LOG_LEVEL", "INFO")
 LOGS_ENDPOINT    = os.environ.get("LOGS_ENDPOINT", "0") == "1"  # expose GET /logs (opt-in)
 LOG_RING_MAX     = _envint("LOG_RING_MAX", 300)                 # recent log lines kept for /logs
+TOKEN_TTL        = _envint("TOKEN_TTL", 30)                     # seconds to cache an injected token
+TOKEN_FAIL_TTL   = 10                                           # cooldown before re-probing a failing token endpoint
+_token_rules     = _parse_token_rules(os.environ.get("TOKEN_INJECT", ""))  # signed-token injection rules
 
 # In-memory ring buffer of recent log lines, surfaced by the opt-in GET /logs endpoint
 # (so logs are reachable over HTTP without a shell on the host).
@@ -128,6 +152,11 @@ def _bump(key: str) -> None:
 _seg_cache: dict = {}            # url -> (ts, raw_bytes, base_url)
 _seg_cache_lock = threading.Lock()
 
+# Cache of injected signed tokens, keyed by token endpoint (tokens are usually
+# time-limited, so re-fetched every TOKEN_TTL seconds).
+_token_cache: dict = {}          # endpoint -> (ts, token)
+_token_lock = threading.Lock()
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -143,6 +172,67 @@ def _safe_host(url: str) -> str:
         return urllib.parse.urlsplit(url).netloc or url
     except ValueError:
         return "<invalid-url>"
+
+
+def _get_token(endpoint: str) -> str | None:
+    """Fetch (and cache) a signed token from a provider endpoint, or None on failure.
+
+    Failures are negatively cached for TOKEN_FAIL_TTL so a down/slow endpoint is probed at
+    most once per cooldown rather than on every proxied request (which would block request
+    threads and hammer the endpoint). The body is sanity-checked so an HTTP 200 error/HTML
+    page is not cached and injected as a bogus token.
+    """
+    now = time.monotonic()
+    with _token_lock:
+        hit = _token_cache.get(endpoint)
+        if hit and now - hit[0] < (TOKEN_TTL if hit[1] else min(TOKEN_TTL, TOKEN_FAIL_TTL)):
+            return hit[1]
+    token = None
+    try:
+        t = urllib3.Timeout(connect=CONNECT_TIMEOUT, read=STREAM_TIMEOUT)
+        r = _pool.request("GET", endpoint, headers=_headers({}), timeout=t)
+        if r.status >= 400:
+            raise OSError(f"HTTP {r.status}")
+        body = r.data.decode("utf-8", "replace").strip()
+        # A signed token is a short, single, printable string — reject obvious non-tokens
+        # (empty, oversized, HTML/JSON pages, anything with whitespace) so a 200 error page
+        # can't poison the cache.
+        if not body or len(body) > 512 or body[0] in "<{[" or any(c.isspace() for c in body):
+            raise OSError(f"implausible token body ({len(body)} chars)")
+        token = body
+    except Exception as e:
+        log.warning("token fetch failed for %s: %s", _safe_host(endpoint), e)
+    with _token_lock:
+        _token_cache[endpoint] = (time.monotonic(), token)  # cache success AND failure (negative)
+    return token
+
+
+def _inject_token(url: str) -> str:
+    """If `url`'s host matches a TOKEN_INJECT rule and the rule's query param has no value
+    anywhere in the query, set it to a freshly-minted token. Surgical — other params are
+    left byte-for-byte intact and any #fragment is preserved. Server-side only, so the token
+    never reaches the client. No-op when no rules are configured."""
+    if not _token_rules:
+        return url
+    base, frag = urllib.parse.urldefrag(url)  # keep the token out of the fragment
+    host = urllib.parse.urlsplit(base).hostname or ""
+    for glob, endpoint, param in _token_rules:
+        if not fnmatch.fnmatch(host, glob):
+            continue
+        occ = list(re.finditer(rf"[?&]{re.escape(param)}=([^&]*)", base))
+        if any(o.group(1) for o in occ):
+            return url  # the param already carries a value
+        token = _get_token(endpoint)
+        if not token:
+            return url  # no token available; let the request proceed (and likely fail) as-is
+        enc = urllib.parse.quote(token, safe="")
+        if occ:  # present but empty -> fill the first occurrence
+            o = occ[0]
+            base = base[:o.start(1)] + enc + base[o.end(1):]
+        else:    # absent -> append to the query
+            base = f"{base}{'&' if '?' in base else '?'}{param}={enc}"
+        return f"{base}#{frag}" if frag else base
+    return url
 
 
 def _chunklist_cache_get(url: str, now: float) -> tuple[bytes, str] | None:
@@ -180,7 +270,7 @@ def _fetch(url: str, extra_headers: dict, timeout: int) -> tuple[bytes, str]:
         try:
             current_url = url
             for _ in range(10):  # follow up to 10 redirects manually
-                r = _pool.request("GET", current_url, headers=h, timeout=t,
+                r = _pool.request("GET", _inject_token(current_url), headers=h, timeout=t,
                                   preload_content=True, redirect=False)
 
                 if r.status in (301, 302, 303, 307, 308):
@@ -562,7 +652,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
         t = urllib3.Timeout(connect=CONNECT_TIMEOUT, read=STREAM_TIMEOUT)
 
         if self.command == "HEAD":
-            r = _pool.request("HEAD", url, headers=h, timeout=t, preload_content=False)
+            r = _pool.request("HEAD", _inject_token(url), headers=h, timeout=t, preload_content=False)
             r.drain_conn()
             self._started = True
             self.send_response(200 if r.status < 400 else r.status)
@@ -582,7 +672,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                        rewrite_m3u8(raw, base, self.proxy_base(), hdrs))
             return
 
-        r = _pool.request("GET", url, headers=h, timeout=t, preload_content=False)
+        r = _pool.request("GET", _inject_token(url), headers=h, timeout=t, preload_content=False)
         if r.status >= 400:
             r.drain_conn()
             # Surface the real upstream status (was a silent 502): raise so the /fetch
@@ -653,9 +743,11 @@ if __name__ == "__main__":
 
     log.info("m3uproxy v%s starting", __version__)
     log.info("config: M3U_URL host=%s | playlist_ttl=%ss | chunklist_ttl=%ss | "
-             "pool num_pools=%d maxsize=%d | max_concurrent=%s | client_timeout=%ss | log_level=%s",
+             "pool num_pools=%d maxsize=%d | max_concurrent=%s | client_timeout=%ss | "
+             "token_rules=%d | log_level=%s",
              _safe_host(M3U_URL) or "(unset)", PLAYLIST_TTL, CHUNKLIST_TTL,
-             POOL_NUM_POOLS, POOL_MAXSIZE, MAX_CONCURRENT or "unlimited", CLIENT_TIMEOUT, LOG_LEVEL)
+             POOL_NUM_POOLS, POOL_MAXSIZE, MAX_CONCURRENT or "unlimited", CLIENT_TIMEOUT,
+             len(_token_rules), LOG_LEVEL)
 
     refresh_playlist()
 

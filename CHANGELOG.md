@@ -6,6 +6,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- Optional upstream signed-token injection (`TOKEN_INJECT`): for providers whose playlist
+  URLs need a token minted at a separate endpoint, the proxy fetches that token (cached
+  `TOKEN_TTL` seconds, default 30) and adds it to matching upstream requests. Rules are
+  `host-glob|token-endpoint|query-param` (`;;`-separated). Server-side only — the token
+  never reaches the client. Failing token endpoints are negatively cached (probed at most
+  once per cooldown, never blocking every request) and implausible responses (HTML/JSON
+  error pages) are rejected rather than cached. Off by default.
+
 ### Fixed
 - Upstream errors on `/fetch` (e.g. an expired or empty-token segment that the origin
   rejects with `403`/`404`/`5xx`) were relayed as a **silent `502`** and miscounted as a
