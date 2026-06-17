@@ -4,6 +4,8 @@ on:
   push:
     branches:
       - main
+    tags:
+      - "v*.*.*"
   pull_request:
     branches:
       - main
@@ -42,7 +44,7 @@ jobs:
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     permissions:
-      contents: read
+      contents: write   # create the GitHub Release on tag pushes
       packages: write
 
     steps:
@@ -62,8 +64,11 @@ jobs:
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
-            type=raw,value=latest
+            type=raw,value=latest,enable={{is_default_branch}}
             type=sha,prefix=
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
 
       - name: Build and push Docker image
         uses: docker/build-push-action@v5
@@ -72,3 +77,16 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+
+      # On a vX.Y.Z tag: publish a GitHub Release. Notes are auto-generated from the
+      # merged PRs since the previous tag; the curated record lives in CHANGELOG.md.
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          body: |
+            Container image: `${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.version }}`
+            (also published as `:${{ steps.meta.outputs.version }}`'s major / major.minor tags).
+
+            Full notes: [CHANGELOG.md](https://github.com/${{ github.repository }}/blob/${{ github.ref_name }}/CHANGELOG.md).

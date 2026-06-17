@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- Release automation: pushing a `vX.Y.Z` tag now builds versioned images (`:X.Y.Z`, `:X.Y`,
+  `:X`) and auto-creates a GitHub Release (notes generated from merged PRs). `:latest` and
+  `:<sha>` continue to track `main`; `docker-compose.yml` pins a release line so deploys
+  follow tagged releases rather than every merge.
 - `SEGMENT_TIMEOUT` (default 20s): bounds the time spent waiting on the **upstream** for a
   single segment. The per-read timeout (`STREAM_TIMEOUT`) only catches a fully stalled
   connection; a slow-trickling upstream could dodge it and hang for ~a minute, freezing the

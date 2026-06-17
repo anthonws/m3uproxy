@@ -188,6 +188,27 @@ cached.
 
 - Emby Media Server
 
+## Releases
+
+Images are published to GHCR:
+
+- `:latest` and `:<sha>` — built on every push to `main` (development / bleeding edge).
+- `:X.Y.Z`, `:X.Y`, `:X` — built when a `vX.Y.Z` tag is pushed, alongside an auto-created
+  GitHub Release.
+
+`docker-compose.yml` pins a release line (e.g. `:1`) so deploys follow tagged releases
+rather than every merge to `main`. Pull a new release with `docker compose pull && docker
+compose up -d` (or pin a stricter `:X.Y` for reproducibility).
+
+**Cutting a release (maintainer):**
+
+1. Bump `__version__` in `proxy.py` and move the `## [Unreleased]` CHANGELOG notes under a
+   new `## [X.Y.Z] - DATE` heading.
+2. Merge to `main`.
+3. Tag and push: `git tag vX.Y.Z && git push origin vX.Y.Z`.
+
+CI then builds the versioned images and publishes the GitHub Release automatically.
+
 ## Security
 
 **Do not expose m3uproxy directly to the internet.** The proxy has no authentication and will relay requests to your upstream M3U source on behalf of anyone who can reach it. It is intended to run on a private network, accessible only to your local media server.
