@@ -102,6 +102,7 @@ generous values cost only kilobytes.
 {
   "ok": true, "version": "1.5", "channels": 1037, "cache_age_s": 12.3,
   "last_refresh_ok_age_s": 12.3, "last_refresh_error": null,
+  "last_request_error": "video-auth2.iol.pt …/chunks.m3u8: OSError: upstream HTTP 403",
   "stream_ok": 42, "stream_err": 0, "fetch_ok": 980, "fetch_err": 3
 }
 ```

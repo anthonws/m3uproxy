@@ -107,6 +107,7 @@ _cache_lock = threading.Lock()
 # ---------------------------------------------------------------------------
 _last_refresh_ok_ts: float = 0.0
 _last_refresh_err: str | None = None
+_last_request_err: str | None = None  # most recent /stream or /fetch failure (host-scoped)
 _stats = {"stream_ok": 0, "stream_err": 0, "fetch_ok": 0, "fetch_err": 0}
 _stats_lock = threading.Lock()
 
@@ -384,6 +385,16 @@ class ProxyHandler(BaseHTTPRequestHandler):
         msg = re.sub(r"\?\S*", "?…", fmt % args)
         log.info("%s – %s", self.address_string(), msg)
 
+    def log_error(self, fmt, *args):
+        # "Request timed out" here is the idle keep-alive reaper closing a connection
+        # Emby left idle past CLIENT_TIMEOUT — expected and benign, so keep it at DEBUG.
+        # Genuine handler errors go to WARNING (with query strings stripped).
+        msg = re.sub(r"\?\S*", "?…", fmt % args)
+        if "timed out" in msg.lower():
+            log.debug("idle connection closed (%s)", self.address_string())
+        else:
+            log.warning("%s – %s", self.address_string(), msg)
+
     def proxy_base(self) -> str:
         host = self.headers.get("Host", f"127.0.0.1:{PORT}")
         return f"http://{host.split(':')[0]}:{PORT}"
@@ -430,6 +441,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
             _sem.release()
 
     def _handle(self):
+        global _last_request_err
         # One handler instance serves multiple requests on a kept-alive connection,
         # so reset per-request state that error paths rely on.
         self._started = False
@@ -452,6 +464,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 "cache_age_s": cache_age,
                 "last_refresh_ok_age_s": round(now - _last_refresh_ok_ts, 1) if _last_refresh_ok_ts else None,
                 "last_refresh_error": _last_refresh_err,
+                "last_request_error": _last_request_err,
                 **stats,
             }
             self._send(200 if n else 503, "application/json", json.dumps(body).encode())
@@ -505,6 +518,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 _bump("stream_ok")
             except Exception as e:
                 log.error("Stream %s error: %s", cid, e)
+                _last_request_err = f"stream {cid}: {type(e).__name__}: {e}"
                 _bump("stream_err")
                 if not self._started:
                     self._error(502)
@@ -527,8 +541,9 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 _bump("fetch_ok")
             except Exception as e:
                 # Log host + filename only — the full URL/query may carry CDN tokens.
-                log.error("Fetch error %s …/%s: %s",
-                          _safe_host(url), url.split("?")[0].rsplit("/", 1)[-1], e)
+                fname = url.split("?")[0].rsplit("/", 1)[-1]
+                log.error("Fetch error %s …/%s: %s", _safe_host(url), fname, e)
+                _last_request_err = f"{_safe_host(url)} …/{fname}: {type(e).__name__}: {e}"
                 _bump("fetch_err")
                 if not self._started:
                     self._error(502)
@@ -570,8 +585,9 @@ class ProxyHandler(BaseHTTPRequestHandler):
         r = _pool.request("GET", url, headers=h, timeout=t, preload_content=False)
         if r.status >= 400:
             r.drain_conn()
-            self._error(502)
-            return
+            # Surface the real upstream status (was a silent 502): raise so the /fetch
+            # handler logs it with the host and counts it as an error.
+            raise OSError(f"upstream HTTP {r.status}")
 
         try:
             # Peek at first 512 bytes to determine content type without buffering everything.
