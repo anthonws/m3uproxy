@@ -101,5 +101,29 @@ class RewriteM3u8Test(unittest.TestCase):
         self.assertTrue(key_line.startswith('#EXT-X-KEY:METHOD=AES-128,URI="'))
 
 
+class ResolveBaseTest(unittest.TestCase):
+    """Guards the segment-base regression: urllib3's geturl() returns a bare PATH for
+    a non-redirected PoolManager request, so the base must be re-absolutised."""
+
+    def test_path_only_response_url_is_absolutised(self):
+        # The exact shape that broke playback: geturl() returns only the path.
+        base = proxy._resolve_base(
+            "https://cdn.example/live/smil:x.smil/chunklist.m3u8",
+            "/live/smil:x.smil/chunklist.m3u8",
+        )
+        self.assertEqual(base, "https://cdn.example/live/smil:x.smil/")
+
+    def test_none_response_url_falls_back_to_request(self):
+        base = proxy._resolve_base("https://cdn.example/a/b/chunk.m3u8", None)
+        self.assertEqual(base, "https://cdn.example/a/b/")
+
+    def test_absolute_redirect_response_url_is_used(self):
+        base = proxy._resolve_base(
+            "https://cdn.example/a/chunk.m3u8",
+            "https://cdn2.example/x/y/chunk.m3u8",
+        )
+        self.assertEqual(base, "https://cdn2.example/x/y/")
+
+
 if __name__ == "__main__":
     unittest.main()
