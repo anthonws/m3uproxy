@@ -6,6 +6,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.7.0] - 2026-06-17
+
 ### Added
 - Release automation: pushing a `vX.Y.Z` tag now builds versioned images (`:X.Y.Z`, `:X.Y`,
   `:X`) and auto-creates a GitHub Release (notes generated from merged PRs). `:latest` and

@@ -1,7 +1,9 @@
 services:
   m3uproxy:
     container_name: m3uproxy
-    image: ghcr.io/anthonws/m3uproxy:latest
+    # Tracks the latest 1.x tagged release (updates on `docker compose pull`, not on every
+    # main merge). Pin tighter (e.g. :1.7) for stricter reproducibility, or :latest for dev.
+    image: ghcr.io/anthonws/m3uproxy:1
     ports:
       - "7654:7654"
     env_file:
