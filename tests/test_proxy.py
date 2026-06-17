@@ -412,5 +412,114 @@ class EnvIntTest(unittest.TestCase):
             proxy._envint("M3U_TEST_INT", 7)
 
 
+class TokenInjectTest(unittest.TestCase):
+    def setUp(self):
+        self._rules = proxy._token_rules
+        self._gettok = proxy._get_token
+        proxy._token_rules = [("video-auth*.example.com", "https://t.example/tok", "sig")]
+        proxy._get_token = lambda ep: "TOK+EN/="  # base64-ish (has +, /, =)
+
+    def tearDown(self):
+        proxy._token_rules = self._rules
+        proxy._get_token = self._gettok
+
+    def test_fills_empty_param_on_matching_host(self):
+        out = proxy._inject_token("https://video-auth2.example.com/x/chunks.m3u8?sig=")
+        self.assertEqual(out, "https://video-auth2.example.com/x/chunks.m3u8?sig=TOK%2BEN%2F%3D")
+
+    def test_appends_param_when_absent(self):
+        out = proxy._inject_token("https://video-auth2.example.com/x/chunks.m3u8")
+        self.assertEqual(out, "https://video-auth2.example.com/x/chunks.m3u8?sig=TOK%2BEN%2F%3D")
+
+    def test_appends_with_ampersand_when_other_params_present(self):
+        out = proxy._inject_token("https://video-auth2.example.com/x/chunks.m3u8?a=1")
+        self.assertEqual(out, "https://video-auth2.example.com/x/chunks.m3u8?a=1&sig=TOK%2BEN%2F%3D")
+
+    def test_untouched_when_param_already_set(self):
+        u = "https://video-auth2.example.com/x/chunks.m3u8?sig=ALREADY"
+        self.assertEqual(proxy._inject_token(u), u)
+
+    def test_appends_before_fragment(self):
+        out = proxy._inject_token("https://video-auth2.example.com/x/chunks.m3u8#frag")
+        self.assertEqual(out, "https://video-auth2.example.com/x/chunks.m3u8?sig=TOK%2BEN%2F%3D#frag")
+
+    def test_skips_when_a_later_duplicate_has_value(self):
+        u = "https://video-auth2.example.com/x/chunks.m3u8?sig=&sig=REAL"
+        self.assertEqual(proxy._inject_token(u), u)
+
+    def test_untouched_on_nonmatching_host(self):
+        u = "https://other.example.org/x/chunks.m3u8?sig="
+        self.assertEqual(proxy._inject_token(u), u)
+
+    def test_noop_when_no_rules(self):
+        proxy._token_rules = []
+        u = "https://video-auth2.example.com/x/chunks.m3u8?sig="
+        self.assertEqual(proxy._inject_token(u), u)
+
+    def test_parse_rules_skips_malformed(self):
+        rules = proxy._parse_token_rules("a*.x|https://t|p ;; bad-rule ;; b*.y|https://u|q ;; |https://z|r")
+        self.assertEqual(rules, [("a*.x", "https://t", "p"), ("b*.y", "https://u", "q")])
+
+
+class TokenFetchTest(unittest.TestCase):
+    def test_get_token_fetches_once_and_caches(self):
+        calls = {"n": 0}
+
+        class _Resp:
+            status = 200
+            data = b"  TOKENVALUE  \n"
+
+        class _Pool:
+            def request(self, *a, **k):
+                calls["n"] += 1
+                return _Resp()
+
+        orig_pool, orig_cache, orig_ttl = proxy._pool, proxy._token_cache, proxy.TOKEN_TTL
+        proxy._pool = _Pool()
+        proxy._token_cache = {}
+        proxy.TOKEN_TTL = 60
+        try:
+            self.assertEqual(proxy._get_token("https://t.example/tok"), "TOKENVALUE")
+            self.assertEqual(proxy._get_token("https://t.example/tok"), "TOKENVALUE")
+            self.assertEqual(calls["n"], 1)  # second call served from cache
+        finally:
+            proxy._pool, proxy._token_cache, proxy.TOKEN_TTL = orig_pool, orig_cache, orig_ttl
+
+    def test_get_token_negatively_caches_failures(self):
+        calls = {"n": 0}
+
+        class _Pool:
+            def request(self, *a, **k):
+                calls["n"] += 1
+                raise OSError("boom")
+
+        orig_pool, orig_cache = proxy._pool, proxy._token_cache
+        proxy._pool = _Pool()
+        proxy._token_cache = {}
+        try:
+            self.assertIsNone(proxy._get_token("https://t.example/down"))
+            self.assertIsNone(proxy._get_token("https://t.example/down"))
+            self.assertEqual(calls["n"], 1)  # failure cached -> not re-probed every call
+        finally:
+            proxy._pool, proxy._token_cache = orig_pool, orig_cache
+
+    def test_get_token_rejects_implausible_body(self):
+        class _Resp:
+            status = 200
+            data = b"<html><body>Service Unavailable</body></html>"
+
+        class _Pool:
+            def request(self, *a, **k):
+                return _Resp()
+
+        orig_pool, orig_cache = proxy._pool, proxy._token_cache
+        proxy._pool = _Pool()
+        proxy._token_cache = {}
+        try:
+            self.assertIsNone(proxy._get_token("https://t.example/maintenance"))
+        finally:
+            proxy._pool, proxy._token_cache = orig_pool, orig_cache
+
+
 if __name__ == "__main__":
     unittest.main()
