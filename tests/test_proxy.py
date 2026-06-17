@@ -5,6 +5,7 @@ Importing the module is side-effect free (the server only starts under
 """
 
 import http.client
+import json
 import os
 import socket
 import sys
@@ -275,6 +276,34 @@ class KeepAliveFramingTest(unittest.TestCase):
         finally:
             proxy._pool = orig
 
+    def test_health_ok_returns_json(self):
+        c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        c.request("GET", "/health")
+        r = c.getresponse()
+        body = json.loads(r.read())
+        self.assertEqual(r.status, 200)
+        self.assertEqual(r.getheader("Content-Type"), "application/json")
+        self.assertTrue(body["ok"])
+        self.assertEqual(body["channels"], 1)
+        self.assertEqual(body["version"], proxy.__version__)
+        for k in ("cache_age_s", "stream_ok", "stream_err", "fetch_ok", "fetch_err"):
+            self.assertIn(k, body)
+        c.close()
+
+    def test_health_503_when_no_channels(self):
+        saved = proxy._channels
+        proxy._channels = {}
+        try:
+            c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+            c.request("GET", "/health")
+            r = c.getresponse()
+            body = json.loads(r.read())
+            self.assertEqual(r.status, 503)
+            self.assertFalse(body["ok"])
+            c.close()
+        finally:
+            proxy._channels = saved
+
     def test_started_flag_resets_between_keepalive_requests(self):
         # A success then a failing request on the SAME connection: the failure must
         # still send its 502. Regression guard for the per-instance _started flag
@@ -292,6 +321,24 @@ class KeepAliveFramingTest(unittest.TestCase):
             c.close()
         finally:
             proxy._fetch = orig
+
+
+class EnvIntTest(unittest.TestCase):
+    def tearDown(self):
+        os.environ.pop("M3U_TEST_INT", None)
+
+    def test_default_when_unset(self):
+        os.environ.pop("M3U_TEST_INT", None)
+        self.assertEqual(proxy._envint("M3U_TEST_INT", 7), 7)
+
+    def test_parses_valid(self):
+        os.environ["M3U_TEST_INT"] = "42"
+        self.assertEqual(proxy._envint("M3U_TEST_INT", 7), 42)
+
+    def test_exits_on_invalid(self):
+        os.environ["M3U_TEST_INT"] = "notanint"
+        with self.assertRaises(SystemExit):
+            proxy._envint("M3U_TEST_INT", 7)
 
 
 if __name__ == "__main__":

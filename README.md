@@ -68,6 +68,7 @@ delimiter, which can silently truncate unquoted values.
 | `POOL_NUM_POOLS`   | `20`    | Number of distinct upstream hosts pooled            |
 | `MAX_CONCURRENT`   | `0`     | Cap on in-flight requests; `0` = unlimited          |
 | `CLIENT_TIMEOUT`   | `30`    | Seconds an idle keep-alive client connection is held |
+| `LOG_LEVEL`        | `INFO`  | Log verbosity (`DEBUG`/`INFO`/`WARNING`/`ERROR`)    |
 
 ### Tuning for larger deployments
 
@@ -90,6 +91,23 @@ by many clients at once):
 
 These are I/O-light: each idle pooled connection is a socket plus small buffers, so even
 generous values cost only kilobytes.
+
+## Monitoring
+
+`GET /health` returns JSON for liveness/readiness checks and a quick operational glance:
+
+```json
+{
+  "ok": true, "version": "1.5", "channels": 1037, "cache_age_s": 12.3,
+  "last_refresh_ok_age_s": 12.3, "last_refresh_error": null,
+  "stream_ok": 42, "stream_err": 0, "fetch_ok": 980, "fetch_err": 3
+}
+```
+
+It returns `200` when channels are loaded and `503` when the cache is empty (e.g. the
+first playlist fetch failed), so it doubles as a container healthcheck. It is exempt from
+`MAX_CONCURRENT` so monitoring stays truthful under load. Logs are structured (timestamp,
+level, message) on stdout; raise detail with `LOG_LEVEL=DEBUG`.
 
 ## Supported Headers
 
