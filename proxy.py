@@ -68,10 +68,12 @@ UA               = os.environ.get("DEFAULT_UA",
                        "Mozilla/5.0 (X11; Linux x86_64; rv:149.0) Gecko/20100101 Firefox/149.0")
 PLAYLIST_TTL     = _envint("PLAYLIST_TTL",     86400)  # seconds between background refreshes
 CONNECT_TIMEOUT  = _envint("CONNECT_TIMEOUT",  5)      # TCP connect timeout
-STREAM_TIMEOUT   = _envint("STREAM_TIMEOUT",   10)     # per-segment read timeout
+STREAM_TIMEOUT   = _envint("STREAM_TIMEOUT",   10)     # per-segment READ timeout (max gap between bytes)
+SEGMENT_TIMEOUT  = _envint("SEGMENT_TIMEOUT",  20)     # total wall-clock per segment (0 disables); fail fast on trickle
 PLAYLIST_TIMEOUT = _envint("PLAYLIST_TIMEOUT", 20)     # playlist fetch timeout
 FETCH_RETRIES    = _envint("FETCH_RETRIES",    2)      # retries on transient errors
 CHUNKLIST_TTL    = _envint("CHUNKLIST_TTL",    2)      # seconds to cache a chunklist (0 disables)
+CHUNKLIST_STALE_TTL = _envint("CHUNKLIST_STALE_TTL", 15)  # serve last-good chunklist this long past TTL on upstream error (0 disables)
 CHUNK_SIZE       = 128 * 1024                          # 128 KB streaming chunks
 SEG_CACHE_MAX    = 500                                 # max cached chunklists (memory bound)
 POOL_NUM_POOLS   = _envint("POOL_NUM_POOLS",   20)     # distinct upstream hosts pooled
@@ -132,7 +134,7 @@ _cache_lock = threading.Lock()
 _last_refresh_ok_ts: float = 0.0
 _last_refresh_err: str | None = None
 _last_request_err: str | None = None  # most recent /stream or /fetch failure (host-scoped)
-_stats = {"stream_ok": 0, "stream_err": 0, "fetch_ok": 0, "fetch_err": 0}
+_stats = {"stream_ok": 0, "stream_err": 0, "fetch_ok": 0, "fetch_err": 0, "fetch_stale": 0}
 _stats_lock = threading.Lock()
 
 
@@ -242,6 +244,18 @@ def _chunklist_cache_get(url: str, now: float) -> tuple[bytes, str] | None:
     with _seg_cache_lock:
         hit = _seg_cache.get(url)
     if hit and now - hit[0] < CHUNKLIST_TTL:
+        return hit[1], hit[2]
+    return None
+
+
+def _chunklist_cache_get_stale(url: str, now: float) -> tuple[bytes, str] | None:
+    """Return a cached chunklist still within the stale-serve grace window
+    (TTL + CHUNKLIST_STALE_TTL), to ride out a brief upstream error. None if disabled/too old."""
+    if CHUNKLIST_TTL <= 0 or CHUNKLIST_STALE_TTL <= 0:
+        return None
+    with _seg_cache_lock:
+        hit = _seg_cache.get(url)
+    if hit and now - hit[0] < CHUNKLIST_TTL + CHUNKLIST_STALE_TTL:
         return hit[1], hit[2]
     return None
 
@@ -469,6 +483,11 @@ class ProxyHandler(BaseHTTPRequestHandler):
     # know not to emit a second HTTP status line over an in-flight response.
     _started = False
 
+    # Per-request outcome for /fetch accounting: "ok", "err" (aborted mid-body) or
+    # "stale" (served a cached chunklist because the upstream errored).
+    _outcome = "ok"
+    _degraded_reason = ""
+
     def log_message(self, fmt, *args):
         # Strip query strings from the logged request line: the proxied /fetch URLs carry
         # Referer/Origin/User-Agent values that can be provider tokens. Keep path only.
@@ -535,6 +554,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
         # One handler instance serves multiple requests on a kept-alive connection,
         # so reset per-request state that error paths rely on.
         self._started = False
+        self._outcome = "ok"
         parsed = urllib.parse.urlparse(self.path)
         path   = parsed.path
         query  = urllib.parse.parse_qs(parsed.query)
@@ -626,9 +646,15 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 t0 = time.monotonic()
                 self._proxy_segment(url, hdrs)
                 elapsed = time.monotonic() - t0
-                label = "CHUNK" if url.endswith(".m3u8") or url.endswith(".m3u") else "SEG"
-                log.info("%s %.0fms %s", label, elapsed * 1000, url.split('/')[-1].split('?')[0])
-                _bump("fetch_ok")
+                if self._outcome == "ok":
+                    label = "CHUNK" if url.endswith(".m3u8") or url.endswith(".m3u") else "SEG"
+                    log.info("%s %.0fms %s", label, elapsed * 1000, url.split('/')[-1].split('?')[0])
+                    _bump("fetch_ok")
+                else:
+                    # Aborted mid-body, or served stale because the upstream errored — record
+                    # it so /health reflects the degradation rather than showing all-green.
+                    _last_request_err = self._degraded_reason
+                    _bump("fetch_err" if self._outcome == "err" else "fetch_stale")
             except Exception as e:
                 # Log host + filename only — the full URL/query may carry CDN tokens.
                 fname = url.split("?")[0].rsplit("/", 1)[-1]
@@ -640,6 +666,19 @@ class ProxyHandler(BaseHTTPRequestHandler):
             return
 
         self._error(404)
+
+    def _serve_stale_chunklist(self, url: str, now: float, hdrs: dict, reason: str) -> bool:
+        """If a recent chunklist for `url` is still within the stale grace window, serve it
+        (re-running the per-request rewrite) and return True; else return False."""
+        stale = _chunklist_cache_get_stale(url, now)
+        if stale is None:
+            return False
+        raw, base = stale
+        log.warning("serving stale chunklist (%s) for %s", reason, _safe_host(url))
+        self._outcome = "stale"
+        self._degraded_reason = f"stale chunklist served ({reason}) {_safe_host(url)}"
+        self._send(200, "application/x-mpegurl", rewrite_m3u8(raw, base, self.proxy_base(), hdrs))
+        return True
 
     def _proxy_segment(self, url: str, hdrs: dict) -> None:
         """
@@ -672,11 +711,20 @@ class ProxyHandler(BaseHTTPRequestHandler):
                        rewrite_m3u8(raw, base, self.proxy_base(), hdrs))
             return
 
-        r = _pool.request("GET", _inject_token(url), headers=h, timeout=t, preload_content=False)
+        try:
+            r = _pool.request("GET", _inject_token(url), headers=h, timeout=t, preload_content=False)
+        except Exception as e:
+            # Connection/timeout error: ride out a brief blip with the last-good chunklist.
+            if self._serve_stale_chunklist(url, now, hdrs, type(e).__name__):
+                return
+            raise
         if r.status >= 400:
             r.drain_conn()
-            # Surface the real upstream status (was a silent 502): raise so the /fetch
-            # handler logs it with the host and counts it as an error.
+            # Transient upstream error: serve a recently-cached chunklist if we have one so a
+            # brief blip doesn't drop the stream; otherwise surface the real status (logged +
+            # counted by the /fetch handler).
+            if self._serve_stale_chunklist(url, now, hdrs, f"upstream HTTP {r.status}"):
+                return
             raise OSError(f"upstream HTTP {r.status}")
 
         try:
@@ -706,21 +754,39 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     self.close_connection = True
                 self.end_headers()
                 self._started = True
+                # Bound the time spent waiting on the UPSTREAM for this segment. A trickling
+                # upstream sends bytes slowly enough to keep dodging the per-read timeout but
+                # can hang for ~a minute and freeze the player. We accumulate only upstream
+                # read time (not client write time, which is legitimate backpressure on a slow
+                # client) and abort + close once it exceeds SEGMENT_TIMEOUT, so the client
+                # retries instead of stalling.
                 try:
                     self.wfile.write(peek)
-                    for chunk in r.stream(CHUNK_SIZE):
+                    stream = r.stream(CHUNK_SIZE)
+                    upstream_read = 0.0
+                    while True:
+                        t_read = time.monotonic()
+                        try:
+                            chunk = next(stream)
+                        except StopIteration:
+                            break
+                        upstream_read += time.monotonic() - t_read
+                        if SEGMENT_TIMEOUT > 0 and upstream_read > SEGMENT_TIMEOUT:
+                            raise TimeoutError(f"upstream stalled past {SEGMENT_TIMEOUT}s")
                         self.wfile.write(chunk)
                     r.release_conn()
                 except (BrokenPipeError, ConnectionResetError):
-                    # Client went away mid-stream; the connection is spent.
+                    # Client went away mid-stream; tear down the incomplete upstream connection.
                     self.close_connection = True
-                    r.drain_conn()
+                    r.close()
                 except Exception as e:
-                    # Headers (incl. Content-Length) are already sent — a failure here
-                    # leaves fewer bytes than promised. Close the connection rather than
-                    # desync a kept-alive socket; do not attempt a second response.
+                    # Upstream stalled/failed mid-body (headers already sent): close rather
+                    # than desync a kept-alive socket, and don't drain a pathological trickle
+                    # (which would re-block this thread). Mark degraded so /fetch counts it.
                     self.close_connection = True
-                    r.drain_conn()
+                    r.close()
+                    self._outcome = "err"
+                    self._degraded_reason = f"segment aborted: {type(e).__name__}: {e}"
                     log.warning("stream aborted mid-body: %s: %s", type(e).__name__, e)
         except Exception:
             r.drain_conn()
@@ -742,12 +808,12 @@ if __name__ == "__main__":
         log.warning("M3U_URL is not set")
 
     log.info("m3uproxy v%s starting", __version__)
-    log.info("config: M3U_URL host=%s | playlist_ttl=%ss | chunklist_ttl=%ss | "
-             "pool num_pools=%d maxsize=%d | max_concurrent=%s | client_timeout=%ss | "
-             "token_rules=%d | log_level=%s",
-             _safe_host(M3U_URL) or "(unset)", PLAYLIST_TTL, CHUNKLIST_TTL,
-             POOL_NUM_POOLS, POOL_MAXSIZE, MAX_CONCURRENT or "unlimited", CLIENT_TIMEOUT,
-             len(_token_rules), LOG_LEVEL)
+    log.info("config: M3U_URL host=%s | playlist_ttl=%ss | chunklist_ttl=%ss (stale=%ss) | "
+             "segment_timeout=%ss | pool num_pools=%d maxsize=%d | max_concurrent=%s | "
+             "client_timeout=%ss | token_rules=%d | log_level=%s",
+             _safe_host(M3U_URL) or "(unset)", PLAYLIST_TTL, CHUNKLIST_TTL, CHUNKLIST_STALE_TTL,
+             SEGMENT_TIMEOUT, POOL_NUM_POOLS, POOL_MAXSIZE, MAX_CONCURRENT or "unlimited",
+             CLIENT_TIMEOUT, len(_token_rules), LOG_LEVEL)
 
     refresh_playlist()
 

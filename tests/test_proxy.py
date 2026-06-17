@@ -10,6 +10,7 @@ import os
 import socket
 import sys
 import threading
+import time
 import unittest
 import urllib.parse
 from http.server import ThreadingHTTPServer
@@ -133,11 +134,28 @@ class ResolveBaseTest(unittest.TestCase):
 class ChunklistCacheTest(unittest.TestCase):
     def setUp(self):
         self._orig_ttl = proxy.CHUNKLIST_TTL
+        self._orig_stale = proxy.CHUNKLIST_STALE_TTL
         proxy._seg_cache.clear()
 
     def tearDown(self):
         proxy.CHUNKLIST_TTL = self._orig_ttl
+        proxy.CHUNKLIST_STALE_TTL = self._orig_stale
         proxy._seg_cache.clear()
+
+    def test_stale_get_within_grace_then_expires(self):
+        proxy.CHUNKLIST_TTL = 2
+        proxy.CHUNKLIST_STALE_TTL = 15
+        proxy._chunklist_cache_put("u", b"raw", "http://b/", now=100.0)
+        # past TTL (2) but within TTL+grace (17): still served as stale
+        self.assertEqual(proxy._chunklist_cache_get_stale("u", now=110.0), (b"raw", "http://b/"))
+        # past the grace window: gone
+        self.assertIsNone(proxy._chunklist_cache_get_stale("u", now=120.0))
+
+    def test_stale_get_disabled(self):
+        proxy.CHUNKLIST_TTL = 2
+        proxy.CHUNKLIST_STALE_TTL = 0
+        proxy._chunklist_cache_put("u", b"raw", "http://b/", now=100.0)
+        self.assertIsNone(proxy._chunklist_cache_get_stale("u", now=101.0))
 
     def test_hit_within_ttl_then_miss_after(self):
         proxy.CHUNKLIST_TTL = 2
@@ -374,6 +392,129 @@ class KeepAliveFramingTest(unittest.TestCase):
             self.assertIn("cdn.example.com", proxy._last_request_err or "")
         finally:
             proxy._pool = orig
+
+    def test_serves_stale_chunklist_on_upstream_503(self):
+        url = "http://cdn.example.com/x/chunks.m3u8"
+        orig_pool = proxy._pool
+        orig_ttl, orig_stale = proxy.CHUNKLIST_TTL, proxy.CHUNKLIST_STALE_TTL
+        proxy.CHUNKLIST_TTL, proxy.CHUNKLIST_STALE_TTL = 2, 60
+        proxy._seg_cache.clear()
+        # entry past TTL but within grace: the fresh-cache check misses (forcing an upstream
+        # fetch) but the stale-serve path is eligible.
+        proxy._chunklist_cache_put(url, b"#EXTM3U\n#EXTINF:4,\nseg.ts\n",
+                                   "http://cdn.example.com/x/", now=time.monotonic() - 5)
+
+        class _Resp503:
+            status = 503
+            headers = {}
+            def drain_conn(self):
+                pass
+
+        class _Pool:
+            def request(self, *a, **k):
+                return _Resp503()
+
+        before_stale = proxy._stats["fetch_stale"]
+        proxy._pool = _Pool()
+        try:
+            c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+            c.request("GET", "/fetch?url=" + urllib.parse.quote(url, safe=""))
+            r = c.getresponse()
+            body = r.read().decode()
+            self.assertEqual(r.status, 200)        # stale served, not 502
+            self.assertIn("/fetch?url=", body)     # rewritten stale chunklist
+            c.close()
+            # observable as a degradation, not a clean success
+            self.assertEqual(proxy._stats["fetch_stale"], before_stale + 1)
+            self.assertIn("stale chunklist served", proxy._last_request_err or "")
+        finally:
+            proxy._pool = orig_pool
+            proxy.CHUNKLIST_TTL, proxy.CHUNKLIST_STALE_TTL = orig_ttl, orig_stale
+            proxy._seg_cache.clear()
+
+    def test_segment_deadline_aborts_on_slow_upstream(self):
+        # A segment whose UPSTREAM reads accumulate past SEGMENT_TIMEOUT must be aborted and
+        # the connection closed (despite a promised Content-Length that would keep it alive).
+        # got_eof proves the abort closed it; fetch_err proves it's counted as a failure.
+        orig_pool, orig_seg = proxy._pool, proxy.SEGMENT_TIMEOUT
+        proxy.SEGMENT_TIMEOUT = 0.05
+        before_err = proxy._stats["fetch_err"]
+
+        class _Resp:
+            status = 200
+            headers = {"Content-Type": "video/mp2t", "Content-Length": "99999999"}
+            def read(self, n=None):
+                return b"\x47" + b"\x00" * 511      # peek: not an m3u8
+            def stream(self, sz):
+                for _ in range(50):
+                    time.sleep(0.03)                # simulate a slow/trickling UPSTREAM read
+                    yield b"\x00" * 4096
+            def release_conn(self):
+                pass
+            def close(self):
+                pass
+
+        class _Pool:
+            def request(self, *a, **k):
+                return _Resp()
+
+        proxy._pool = _Pool()
+        try:
+            s = socket.create_connection(("127.0.0.1", self.port), timeout=4)
+            s.sendall(b"GET /fetch?url=http%3A%2F%2Fcdn.example.com%2Fx%2Fseg.ts "
+                      b"HTTP/1.1\r\nHost: x\r\n\r\n")
+            s.settimeout(4)
+            got_eof = False
+            while True:
+                try:
+                    chunk = s.recv(65536)
+                except socket.timeout:
+                    break
+                if chunk == b"":
+                    got_eof = True
+                    break
+            s.close()
+            self.assertTrue(got_eof, "connection must close after the segment deadline")
+            self.assertEqual(proxy._stats["fetch_err"], before_err + 1)  # counted as a failure
+        finally:
+            proxy._pool, proxy.SEGMENT_TIMEOUT = orig_pool, orig_seg
+
+    def test_slow_client_is_not_falsely_aborted(self):
+        # A fast upstream whose total wall-clock exceeds SEGMENT_TIMEOUT only because the
+        # client drains slowly must NOT be aborted: upstream-read time is what's bounded.
+        orig_pool, orig_seg = proxy._pool, proxy.SEGMENT_TIMEOUT
+        proxy.SEGMENT_TIMEOUT = 0.05
+
+        total = 512 + 8 * 4096  # peek + streamed chunks
+
+        class _Resp:
+            status = 200
+            headers = {"Content-Type": "video/mp2t", "Content-Length": str(total)}
+            def read(self, n=None):
+                return b"\x47" + b"\x00" * 511
+            def stream(self, sz):
+                for _ in range(8):
+                    yield b"\x00" * 4096            # instant upstream reads
+            def release_conn(self):
+                pass
+            def close(self):
+                pass
+
+        class _Pool:
+            def request(self, *a, **k):
+                return _Resp()
+
+        proxy._pool = _Pool()
+        try:
+            c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+            c.request("GET", "/fetch?url=http%3A%2F%2Fcdn.example.com%2Fx%2Fseg.ts")
+            r = c.getresponse()
+            body = r.read()                          # client reads fully (no real backpressure)
+            self.assertEqual(r.status, 200)
+            self.assertEqual(len(body), total)       # full body delivered, not aborted
+            c.close()
+        finally:
+            proxy._pool, proxy.SEGMENT_TIMEOUT = orig_pool, orig_seg
 
     def test_started_flag_resets_between_keepalive_requests(self):
         # A success then a failing request on the SAME connection: the failure must

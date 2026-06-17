@@ -6,6 +6,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- `SEGMENT_TIMEOUT` (default 20s): bounds the time spent waiting on the **upstream** for a
+  single segment. The per-read timeout (`STREAM_TIMEOUT`) only catches a fully stalled
+  connection; a slow-trickling upstream could dodge it and hang for ~a minute, freezing the
+  player. The proxy now aborts and closes the connection once accumulated upstream-read time
+  exceeds the budget, so the client retries instead of stalling. Client backpressure (a slow
+  player) is excluded, so a slow-but-healthy client isn't falsely aborted. Set `0` to disable.
+- `CHUNKLIST_STALE_TTL` (default 15s): on a transient upstream error (e.g. a `503` burst),
+  serve the last-good chunklist for a short grace window past its TTL instead of dropping
+  the stream. Set `0` to disable. (Can't help when the whole CDN is down — no fresh
+  segments exist.)
+- `/health` gains a `fetch_stale` counter; aborted segments count as `fetch_err` and served-
+  stale chunklists as `fetch_stale` (with `last_request_error` set), so flapping upstreams
+  are visible instead of showing all-green.
+
 ## [1.6] - 2026-06-17
 
 First tagged GitHub release. Captures all work since `v1.3`: silent-failure correctness
