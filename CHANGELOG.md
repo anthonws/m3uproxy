@@ -6,6 +6,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- Chunklist micro-cache (`CHUNKLIST_TTL`, default 2s): concurrent viewers of the
+  same channel now share one upstream chunklist fetch per TTL window instead of
+  re-fetching on every poll. Raw bytes are cached and the per-request rewrite still
+  runs on a hit, so injected headers stay correct; TS segments are never cached.
+  Set `CHUNKLIST_TTL=0` to disable.
+
 ### Fixed
 - Preserve `#EXTM3U` header attributes (e.g. `url-tvg`) in the proxied playlist.
   `refresh_playlist` declared `global _channels, _cache_ts` but assigned `_header`,
