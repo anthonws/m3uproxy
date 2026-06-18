@@ -45,7 +45,7 @@ Suggested order: top to bottom (lowest-risk/highest-value first). Pick one coher
 
 ### Container & deploy hardening (M5)
 
-- [ ] **5.5 — Suppress the `Server` version banner.** `proxy.py`: set `ProxyHandler` class
+- [x] **5.5 — Suppress the `Server` version banner.** `proxy.py`: set `ProxyHandler` class
   attrs `server_version = "m3uproxy"` and `sys_version = ""`. *(S)* — Accept: `curl -sI`
   shows no `Python/3.12.x`.
 - [ ] **5.1 — Run as non-root.** `Dockerfile`: after `COPY proxy.py .`, `RUN adduser -D -u

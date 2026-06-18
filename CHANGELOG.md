@@ -6,6 +6,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Security
+- Suppress Python runtime version from the `Server` response header. `ProxyHandler` now
+  sets `server_version = "m3uproxy"` and `sys_version = ""`, so the header reads `Server:
+  m3uproxy` rather than `Server: BaseHTTP/0.6 Python/3.12.x`.
+
 ## [1.7.0] - 2026-06-17
 
 ### Added
