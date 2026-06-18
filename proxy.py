@@ -478,6 +478,9 @@ class ProxyHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     # Reap idle kept-alive connections so they don't pin a thread indefinitely.
     timeout = CLIENT_TIMEOUT
+    # Don't advertise the Python runtime version in the Server response header.
+    server_version = "m3uproxy"
+    sys_version = ""
 
     # Set True once a response (status line + headers) has begun, so error paths
     # know not to emit a second HTTP status line over an in-flight response.

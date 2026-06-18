@@ -534,6 +534,16 @@ class KeepAliveFramingTest(unittest.TestCase):
         finally:
             proxy._fetch = orig
 
+    def test_server_banner_suppressed(self):
+        c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        c.request("GET", "/health")
+        r = c.getresponse()
+        r.read()
+        server_hdr = r.getheader("Server", "")
+        self.assertNotIn("Python", server_hdr)
+        self.assertIn("m3uproxy", server_hdr)
+        c.close()
+
 
 class EnvIntTest(unittest.TestCase):
     def tearDown(self):
